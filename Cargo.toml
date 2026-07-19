@@ -10,7 +10,7 @@
 # This is the v0.0.0 bootstrap skeleton (gate infra + layout); the v0.1.0 unit fills in the trait.
 [package]
 name = "dig-chainsource-interface"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
