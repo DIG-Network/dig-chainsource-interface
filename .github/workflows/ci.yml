@@ -37,10 +37,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Check clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --all-features
 
       - name: Check documentation
         run: cargo doc --no-deps
@@ -73,7 +73,7 @@ jobs:
       # intact. The whole crate is exercised and counted; nothing is ignored.
       - name: Run tests with coverage (nextest, retries 2, gate >=80% lines)
         run: >-
-          cargo llvm-cov nextest --all
+          cargo llvm-cov nextest --all --all-features
           --retries 2
           --fail-under-lines 80
           --lcov --output-path lcov.info
