@@ -1,0 +1,25 @@
+# dig-chainsource-interface — the DIG Network canonical ChainSource provider interface.
+#
+# The SINGLE pure trait + query types every Chia chain-source provider implements and every
+# consumer depends on. There is ONE ChainSource contract for the whole ecosystem — never a
+# per-crate copy that could byte-drift. This crate is a pure LEAF: trait + query/result types +
+# a typed error + KATs + docs. It performs NO I/O, holds NO keys, opens NO network, and ships NO
+# concrete provider — those live in the provider crates and in chia-query (the registry +
+# aggregating canonical source). See SPEC.md for the normative contract.
+#
+# This is the v0.0.0 bootstrap skeleton (gate infra + layout); the v0.1.0 unit fills in the trait.
+[package]
+name = "dig-chainsource-interface"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "Apache-2.0 OR MIT"
+description = "The DIG Network canonical ChainSource provider interface: the single pure trait + query types every Chia chain-source provider implements and every consumer depends on. Reads-only, no I/O, no keys, no network — chia-* deps only."
+repository = "https://github.com/DIG-Network/dig-chainsource-interface"
+readme = "README.md"
+keywords = ["dig", "chia", "chainsource", "coin", "provider"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
+
+[dependencies]
+
+[dev-dependencies]
