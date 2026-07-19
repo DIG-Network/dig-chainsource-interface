@@ -6,11 +6,9 @@
 # a typed error + KATs + docs. It performs NO I/O, holds NO keys, opens NO network, and ships NO
 # concrete provider — those live in the provider crates and in chia-query (the registry +
 # aggregating canonical source). See SPEC.md for the normative contract.
-#
-# This is the v0.0.0 bootstrap skeleton (gate infra + layout); the v0.1.0 unit fills in the trait.
 [package]
 name = "dig-chainsource-interface"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -21,5 +19,13 @@ keywords = ["dig", "chia", "chainsource", "coin", "provider"]
 categories = ["cryptography::cryptocurrencies", "api-bindings"]
 
 [dependencies]
+chia-protocol = "0.26"
+thiserror = "2"
+
+[features]
+default = []
+testing = []
 
 [dev-dependencies]
+chia-traits = "0.26"
+hex = "0.4"
