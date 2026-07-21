@@ -47,4 +47,43 @@ pub enum ChainSourceError {
     /// the chain was never consulted, so the answer is unknown → fail closed.
     #[error("no chain source provider available")]
     NoProvider,
+
+    /// The backend returned more records than the consumer's hostile-input bound allows.
+    ///
+    /// Distinct from [`Malformed`](Self::Malformed): each record may be individually well-formed, but
+    /// the *count* exceeds the cap the consumer will accept, so the read is refused → fail closed. This
+    /// lets a consumer distinguish "the data is corrupt" from "the response is too large".
+    #[error("chain source returned {count} records, exceeding the {limit}-record cap")]
+    TooManyRecords {
+        /// The number of records the backend returned.
+        count: usize,
+        /// The maximum number of records the consumer will accept.
+        limit: usize,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn too_many_records_display_reports_count_and_limit() {
+        let err = ChainSourceError::TooManyRecords {
+            count: 100_001,
+            limit: 100_000,
+        };
+        assert_eq!(
+            err.to_string(),
+            "chain source returned 100001 records, exceeding the 100000-record cap"
+        );
+    }
+
+    #[test]
+    fn too_many_records_is_distinct_from_malformed() {
+        let too_many = ChainSourceError::TooManyRecords { count: 5, limit: 1 };
+        let malformed = ChainSourceError::Malformed("truncated coin record".to_string());
+        assert_ne!(too_many, malformed);
+        assert!(matches!(too_many, ChainSourceError::TooManyRecords { .. }));
+        assert!(!matches!(too_many, ChainSourceError::Malformed(_)));
+    }
 }
