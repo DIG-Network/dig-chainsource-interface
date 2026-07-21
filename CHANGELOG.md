@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.2.0] - 2026-07-21
 
 ### Features
-- Add `ChainSourceError::TooManyRecords { count, limit }` — a dedicated over-cap record-count error, distinct from `Malformed` (#1352)
+- Add ChainSourceError::TooManyRecords over-cap variant (#2)
 
 ## [0.1.0] - 2026-07-19
 
