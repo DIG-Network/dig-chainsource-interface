@@ -53,6 +53,9 @@ Every fallible method distinguishes:
 - `Timeout` — the read did not complete in time.
 - `RateLimited` — the backend refused for rate-limiting.
 - `NoProvider` — no provider was available (empty/exhausted registry).
+- `TooManyRecords { count, limit }` — the backend returned more records than the consumer's
+  hostile-input bound allows; distinct from `Malformed` (each record may be well-formed, but the
+  count exceeds the cap) — the consumer fails closed the same as every other variant.
 
 Absence MUST NOT be encoded as an error; an error MUST NOT be degraded to a value.
 
