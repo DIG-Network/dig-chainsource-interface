@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.3.0] - 2026-08-04
+
+### Features
+- **deps:** Migrate to the chia-0.36 family (chia-protocol 0.36.1)
+
 ## [0.2.0] - 2026-07-21
 
 ### Features
