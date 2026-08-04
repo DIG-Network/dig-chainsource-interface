@@ -8,7 +8,7 @@
 # aggregating canonical source). See SPEC.md for the normative contract.
 [package]
 name = "dig-chainsource-interface"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -19,7 +19,7 @@ keywords = ["dig", "chia", "chainsource", "coin", "provider"]
 categories = ["cryptography::cryptocurrencies", "api-bindings"]
 
 [dependencies]
-chia-protocol = "0.26"
+chia-protocol = "0.36.1"
 thiserror = "2"
 
 [features]
@@ -27,5 +27,5 @@ default = []
 testing = []
 
 [dev-dependencies]
-chia-traits = "0.26"
+chia-traits = "0.36.1"
 hex = "0.4"
