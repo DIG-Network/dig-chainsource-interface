@@ -35,12 +35,30 @@
 //! actual reveal+solution — a spoofed curried-puzzle coin has no genuine recreation parent-spend,
 //! so the walk fails closed. This crate supplies that primitive (and [`SingletonLineage`], whose
 //! authority is MEMBERSHIP, not tip-equality); consumers supply the trust logic on top.
+//!
+//! ## The canonical lineage walk (feature `lineage-walk`)
+//!
+//! [`ChainSource::resolve_singleton_lineage`] is the one method with no default body, so a source
+//! backed only by primitive reads would have to hand-roll that money-critical authentication. Enable
+//! the non-default `lineage-walk` feature and the whole walk is supplied — the method body becomes a
+//! one-line delegation to [`resolve_singleton_lineage_via_walk`]:
+//!
+//! ```toml
+//! dig-chainsource-interface = { version = "0.4", features = ["lineage-walk"] }
+//! ```
+//!
+//! The feature is OFF by default because the walk needs a CLVM evaluator (it runs each parent's
+//! inner puzzle to DERIVE its successor), and a consumer that only depends on the trait should not
+//! pay for one.
 
 mod error;
 mod lineage;
 mod provider;
 mod record;
 mod source;
+
+#[cfg(feature = "lineage-walk")]
+mod walk;
 
 #[cfg(feature = "testing")]
 mod testing;
@@ -50,6 +68,12 @@ pub use lineage::SingletonLineage;
 pub use provider::{ProviderId, ProviderInfo, ProviderKind};
 pub use record::CoinRecord;
 pub use source::{ChainSource, ChainSourceProvider};
+
+#[cfg(feature = "lineage-walk")]
+pub use walk::{
+    resolve_singleton_lineage_via_walk, walk_singleton_lineage, walk_singleton_lineage_bounded,
+    LineageWalkError, MAX_LINEAGE_DEPTH,
+};
 
 #[cfg(feature = "testing")]
 pub use testing::MockChainSource;

@@ -8,7 +8,7 @@
 # aggregating canonical source). See SPEC.md for the normative contract.
 [package]
 name = "dig-chainsource-interface"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -22,10 +22,42 @@ categories = ["cryptography::cryptocurrencies", "api-bindings"]
 chia-protocol = "0.36.1"
 thiserror = "2"
 
+# --- `lineage-walk` only (see [features]) ------------------------------------------------------
+# The canonical launcher -> tip singleton walk DERIVES each successor by running the parent's inner
+# puzzle, so it needs a CLVM evaluator and the vetted singleton layer/puzzle types. Every version is
+# pinned to the same coherent chia-* set the rest of the DIG on-chain line rides (chia-protocol
+# 0.36 / chia-wallet-sdk 0.34); the SDK's own SingletonLayer is reused rather than re-implemented so
+# the walk cannot byte-drift from the puzzle it authenticates against.
+chia-puzzle-types = { version = "0.36.1", optional = true }
+chia-puzzles = { version = "0.20", optional = true }
+chia-sdk-driver = { version = "0.34", optional = true }
+chia-sdk-types = { version = "0.34", optional = true }
+clvm-traits = { version = "0.36.1", optional = true }
+clvm-utils = { version = "0.36.1", optional = true }
+clvmr = { version = "0.16", optional = true }
+
 [features]
 default = []
 testing = []
+# The canonical singleton lineage walk (`walk_singleton_lineage`). NON-DEFAULT: it pulls in a CLVM
+# evaluator, and a consumer that only depends on the trait should not pay for one. Enabling it is
+# purely additive — no existing item changes shape.
+lineage-walk = [
+    "dep:chia-puzzle-types",
+    "dep:chia-puzzles",
+    "dep:chia-sdk-driver",
+    "dep:chia-sdk-types",
+    "dep:clvm-traits",
+    "dep:clvm-utils",
+    "dep:clvmr",
+]
 
 [dev-dependencies]
 chia-traits = "0.36.1"
 hex = "0.4"
+# The in-process Chia Simulator: the lineage-walk tests authenticate against REAL singleton spends
+# (launcher, eve, recreation, melt) rather than hand-built fixtures, so the adversarial cases are
+# genuine chain data.
+chia-sdk-test = "0.34"
+chia-bls = "0.36.1"
+anyhow = "1"

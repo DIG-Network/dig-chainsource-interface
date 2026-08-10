@@ -1,4 +1,4 @@
-# dig-chainsource-interface — normative specification (v0.1.0)
+# dig-chainsource-interface — normative specification (v0.4.0)
 
 This is the authoritative contract for the DIG Network canonical `ChainSource` interface. An
 independent reimplementation of this crate, of a provider, or of a consumer MUST conform to this
@@ -56,6 +56,9 @@ Every fallible method distinguishes:
 - `TooManyRecords { count, limit }` — the backend returned more records than the consumer's
   hostile-input bound allows; distinct from `Malformed` (each record may be well-formed, but the
   count exceeds the cap) — the consumer fails closed the same as every other variant.
+- `LineageTooDeep { limit }` — a singleton lineage walk exceeded its hop bound (§4a). The lineage it
+  could build is INCOMPLETE, so it is refused rather than truncated: a partial member set would make
+  `contains` answer `false` for genuine members, which is a fail-OPEN membership answer.
 
 Absence MUST NOT be encoded as an error; an error MUST NOT be degraded to a value.
 
@@ -71,6 +74,56 @@ the launcher to its current tip — each coin the singleton recreation of the pr
 echo a caller-supplied coin into the lineage. Echoing would make `contains` meaningless and allow a
 foreign coin to claim authority. Consumers authenticate coins by walking `parent_spend` toward the
 real launcher and testing lineage membership — never by puzzle-hash equality.
+
+## 4a. The canonical lineage walk (feature `lineage-walk`)
+
+`ChainSource::resolve_singleton_lineage` has no default body, so a source backed only by primitive
+reads would have to hand-roll the §4 money-critical requirement. The optional, NON-DEFAULT
+`lineage-walk` feature supplies that walk once, as free functions:
+
+```rust
+pub const MAX_LINEAGE_DEPTH: usize = 100_000;
+
+pub enum LineageWalkError<E> { Source(E), Malformed(String), NotASingleton { coin_id }, TooDeep { limit } }
+
+pub fn walk_singleton_lineage<S: ChainSource>(source: &S, launcher_id: Bytes32)
+    -> Result<Option<SingletonLineage>, LineageWalkError<S::Error>>;
+
+pub fn walk_singleton_lineage_bounded<S: ChainSource>(source: &S, launcher_id: Bytes32, max_hops: usize)
+    -> Result<Option<SingletonLineage>, LineageWalkError<S::Error>>;
+
+pub fn resolve_singleton_lineage_via_walk<S: ChainSource<Error = ChainSourceError>>(
+    source: &S, launcher_id: Bytes32) -> Result<Option<SingletonLineage>, ChainSourceError>;
+```
+
+A conforming walk MUST:
+
+1. **Derive, never recognise.** At each hop it reads the current coin's own spend, requires the
+   returned spend to BE that coin's spend, requires the puzzle reveal to hash to that coin's puzzle
+   hash, parses the reveal as a singleton curried to the launcher under resolution, runs the inner
+   puzzle, and RECONSTRUCTS the odd-amount successor's full puzzle hash from the launcher id and the
+   successor's inner puzzle hash. It MUST NOT select the successor by puzzle-hash equality, by
+   curried launcher id alone, or from `coin_records_by_parent` — every one of those is spoofable,
+   because a coin's `puzzle_hash` is attacker-chosen.
+2. **Bind each derived coin to chain state.** A CLVM solution is not committed to by a coin's puzzle
+   hash, so a dishonest source could pair a genuine reveal with a fabricated solution. Each derived
+   successor MUST be confirmed to exist via `coin_record` before it enters the lineage.
+3. **Decode the `CREATE_COIN` amount as SIGNED.** CLVM atoms carry no sign, so the singleton melt
+   marker `-113` decodes into a `u64` as `143` — an odd, positive amount indistinguishable from an
+   ordinary recreation. A walk that made that mistake would invent a phantom successor for every
+   melted singleton instead of reporting the melt.
+4. **Refuse, never truncate, past its bound** (`MAX_LINEAGE_DEPTH` spends by default) and reject a
+   repeated coin id as a cycle.
+5. **Preserve the three-valued discipline of §3.** `Ok(None)` means the launcher id names no coin,
+   names a coin that is not wearing `SINGLETON_LAUNCHER_HASH`, was never spent into an eve, or the
+   singleton was melted. Every read failure surfaces as `LineageWalkError::Source(_)` carrying the
+   source's OWN error unchanged, so *unsupported* stays distinguishable from *unreadable* and
+   neither is ever collapsed into an absence.
+
+**Stated limit.** An eve coin that has never been spent is admitted on the evidence of the launcher's
+own spend, which is the strongest evidence that exists: the eve is by definition the coin the
+launcher created. Its inner structure is constrained only once it is itself spent, at which point the
+curried launcher id is checked.
 
 ## 5. `CoinRecord` and `CoinState` conversion
 
@@ -114,5 +167,6 @@ A conforming provider MUST:
    `chia-protocol`).
 3. Map `CoinState` per §5.
 4. Return a genuine forward-walked lineage from `resolve_singleton_lineage` per §4 — never an echo.
+   A source backed only by primitive reads SHOULD delegate to the §4a walk rather than hand-roll one.
 5. Report a `ProviderInfo` per §6.
 6. Remain reads-only: expose no broadcast/spend path through this interface.

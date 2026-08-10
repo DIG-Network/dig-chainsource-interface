@@ -60,6 +60,19 @@ pub enum ChainSourceError {
         /// The maximum number of records the consumer will accept.
         limit: usize,
     },
+
+    /// A singleton lineage walk exceeded its hop bound before reaching the tip.
+    ///
+    /// Distinct from every other variant, and deliberately NOT a silent truncation: the walk found
+    /// more hops than it will follow, so the lineage it could build is INCOMPLETE and must never be
+    /// presented as the whole lineage (a partial member set would make
+    /// [`SingletonLineage::contains`](crate::SingletonLineage::contains) answer `false` for genuine
+    /// members — a fail-OPEN membership answer on a money path). The answer is unknown → fail closed.
+    #[error("singleton lineage walk exceeded its {limit}-hop bound")]
+    LineageTooDeep {
+        /// The hop bound the walk refused to exceed.
+        limit: usize,
+    },
 }
 
 #[cfg(test)]
