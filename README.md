@@ -54,7 +54,7 @@ trust-critical: its result IS the authority set consumers test membership agains
 only by primitive reads can borrow the whole walk instead of hand-rolling it:
 
 ```toml
-dig-chainsource-interface = { version = "0.4", features = ["lineage-walk"] }
+dig-chainsource-interface = { version = "0.3", features = ["lineage-walk"] }
 ```
 
 ```rust

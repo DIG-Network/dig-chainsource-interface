@@ -44,7 +44,7 @@
 //! one-line delegation to [`resolve_singleton_lineage_via_walk`]:
 //!
 //! ```toml
-//! dig-chainsource-interface = { version = "0.4", features = ["lineage-walk"] }
+//! dig-chainsource-interface = { version = "0.3", features = ["lineage-walk"] }
 //! ```
 //!
 //! The feature is OFF by default because the walk needs a CLVM evaluator (it runs each parent's
