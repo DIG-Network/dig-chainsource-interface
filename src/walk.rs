@@ -50,6 +50,7 @@ use clvmr::{Allocator, NodePtr};
 
 use crate::error::ChainSourceError;
 use crate::lineage::SingletonLineage;
+use crate::record::CoinRecord;
 use crate::source::ChainSource;
 
 /// The maximum number of SPENDS [`walk_singleton_lineage`] follows before failing closed with
@@ -61,8 +62,16 @@ use crate::source::ChainSource;
 /// not a policy limit. Its purpose is that a hostile or malformed source cannot make the walk loop
 /// forever or allocate without end: the member set is capped at this many `Bytes32`, i.e. ~3.2 MB.
 ///
-/// The value matches `dig_did::resolve::MAX_LINEAGE_DEPTH`, so the two walks in the ecosystem refuse
-/// at exactly the same depth rather than disagreeing about what "too deep" means.
+/// # The canonical bound — depend on this constant, never re-declare the literal
+///
+/// This is the ecosystem's SINGLE source of truth for how deep a singleton lineage walk may go.
+/// Every DIG crate that bounds such a walk MUST read it from here rather than declaring its own
+/// `100_000`: two literals that must agree, with nothing enforcing it, drift the moment one is
+/// tuned, and the two walks then disagree about what "too deep" means on a money path.
+///
+/// This crate is `00-foundation`, so every consumer sits strictly above it and the dependency is a
+/// legal downward edge. Known re-declarations still to adopt it: `dig_did::resolve` and
+/// `dig_evidence::MAX_LINEAGE_DEPTH`.
 pub const MAX_LINEAGE_DEPTH: usize = 100_000;
 
 /// Why a singleton lineage walk could not answer.
@@ -179,11 +188,25 @@ where
 /// | it names a coin that is not a singleton launcher | `Ok(None)` |
 /// | the launcher was never spent (no eve minted) | `Ok(None)` |
 /// | the singleton was melted (a spend with no odd successor) | `Ok(None)` |
+/// | the launcher minted an eve that is still unspent | `Ok(Some(lineage))`, launcher + eve (see below) |
 /// | a live singleton | `Ok(Some(lineage))`, launcher → tip inclusive |
 /// | a source read failed | `Err(LineageWalkError::Source(_))` |
-/// | the chain data is inconsistent | `Err(LineageWalkError::Malformed(_))` |
+/// | the chain data is inconsistent, incl. a spent coin whose spend the source cannot serve | `Err(LineageWalkError::Malformed(_))` |
 /// | a coin is not a genuine singleton of this launcher | `Err(LineageWalkError::NotASingleton { .. })` |
 /// | the hop bound was exceeded | `Err(LineageWalkError::TooDeep { .. })` |
+///
+/// # The unspent eve (SPEC §4a)
+///
+/// An eve that has never been spent is admitted on its launcher's word alone: a launcher's
+/// `CREATE_COIN` carries the eve's FULL puzzle hash, and the walk cannot yet parse a reveal to
+/// confirm the eve really wears a singleton curried to this launcher. So a launcher spent into an
+/// ordinary coin resolves to `Ok(Some(_))` with that coin as the tip, not `Ok(None)`.
+///
+/// This is sound rather than merely tolerated. The full hash is non-invertible, so only the
+/// launcher's own spender could have chosen it — nothing an attacker supplies reaches this
+/// decision. And it fails closed at the very next hop: the moment the eve is spent, its reveal is
+/// parsed and a non-singleton yields [`LineageWalkError::NotASingleton`]. A consumer that needs a
+/// *proven* singleton, rather than a launched one, must therefore require a tip beyond the eve.
 pub fn walk_singleton_lineage<S: ChainSource>(
     source: &S,
     launcher_id: Bytes32,
@@ -206,7 +229,10 @@ pub fn walk_singleton_lineage_bounded<S: ChainSource>(
 
     let mut allocator = Allocator::new();
     let mut members = BTreeSet::from([launcher_id]);
-    let mut current = launcher;
+    let mut current = launcher.coin;
+    // Carried alongside `current` because `coin_spend` answers `Ok(None)` for "unspent OR unknown";
+    // only the coin's OWN record tells those apart (see [`read_spend_of`]).
+    let mut current_spent_height = launcher.spent_height;
     // The launcher's own spend is structurally different from a singleton spend (its CREATE_COIN
     // already carries the eve's FULL puzzle hash), so the first hop is handled separately.
     let mut at_launcher = true;
@@ -214,7 +240,7 @@ pub fn walk_singleton_lineage_bounded<S: ChainSource>(
     // `max_hops` counts SPENDS followed, so the loop runs one extra time: the final read is the one
     // that discovers the tip is unspent, and it follows no spend.
     for _hop in 0..=max_hops {
-        let Some(spend) = read_spend_of(source, current)? else {
+        let Some(spend) = read_spend_of(source, current, current_spent_height)? else {
             // An unspent coin is the tip — unless it is the launcher itself, in which case no
             // singleton state was ever minted.
             return Ok((!at_launcher).then(|| SingletonLineage::new(current.coin_id(), members)));
@@ -235,29 +261,46 @@ pub fn walk_singleton_lineage_bounded<S: ChainSource>(
         // A solution is NOT committed to by a coin's puzzle hash, so a dishonest source could pair a
         // genuine reveal with a fabricated solution and steer the walk onto a coin the chain never
         // created. Requiring the derived successor to exist on chain binds every hop to real state.
-        require_coin_exists(source, successor)?;
+        let record = require_coin_exists(source, successor)?;
 
-        if !members.insert(successor.coin_id()) {
-            return Err(LineageWalkError::Malformed(format!(
-                "coin {} repeats in the lineage (a cycle)",
-                successor.coin_id()
-            )));
-        }
+        admit_member(&mut members, successor.coin_id())?;
         current = successor;
+        current_spent_height = record.spent_height;
         at_launcher = false;
     }
 
     Err(LineageWalkError::TooDeep { limit: max_hops })
 }
 
+/// Records `coin_id` as a lineage member, refusing a repeat.
+///
+/// Fused with the insertion on purpose: a cycle guard that can be deleted without also dropping the
+/// member is a guard nothing protects, and the walk's completeness test only notices the missing
+/// member. Written as one operation, weakening the refusal means editing this function, where the
+/// unit test below sits.
+fn admit_member<E>(
+    members: &mut BTreeSet<Bytes32>,
+    coin_id: Bytes32,
+) -> Result<(), LineageWalkError<E>> {
+    if members.insert(coin_id) {
+        return Ok(());
+    }
+    Err(LineageWalkError::Malformed(format!(
+        "coin {coin_id} repeats in the lineage (a cycle)"
+    )))
+}
+
 /// Reads the launcher coin named by `launcher_id`, or `None` when no singleton was launched there.
 ///
 /// A coin id that names nothing, or names a coin that is not wearing the well-known singleton
 /// launcher puzzle, means the singleton genuinely does not exist — not that the read failed.
+///
+/// The whole record is returned, not just the coin: the walk needs `spent_height` to tell an
+/// unspent launcher from one whose spend the source cannot serve.
 fn read_launcher_coin<S: ChainSource>(
     source: &S,
     launcher_id: Bytes32,
-) -> Result<Option<Coin>, LineageWalkError<S::Error>> {
+) -> Result<Option<CoinRecord>, LineageWalkError<S::Error>> {
     let Some(record) = source
         .coin_record(launcher_id)
         .map_err(LineageWalkError::Source)?
@@ -273,23 +316,38 @@ fn read_launcher_coin<S: ChainSource>(
     if record.coin.puzzle_hash != Bytes32::new(SINGLETON_LAUNCHER_HASH) {
         return Ok(None);
     }
-    Ok(Some(record.coin))
+    Ok(Some(record))
 }
 
 /// Reads the spend of `coin`, proving the returned spend really is that coin's and that its puzzle
-/// reveal hashes to the coin's own puzzle hash.
+/// reveal hashes to the coin's own puzzle hash. `spent_height` is `coin`'s own record field.
 ///
-/// Both checks defend against a lying source: without them, an attacker-supplied reveal could be
+/// Both proofs defend against a lying source: without them, an attacker-supplied reveal could be
 /// run in place of the coin's real puzzle and emit any successor it liked.
+///
+/// `Ok(None)` means the coin is genuinely UNSPENT, never merely that no spend came back.
+/// [`ChainSource::coin_spend`] returns `Ok(None)` for "unspent **or unknown**", and the coin's own
+/// `spent_height` is the only thing that separates them. Conflating the two lets an honest-looking
+/// source that has simply lost a spend present a superseded coin as the current tip — and if the
+/// lost spend was the MELT, a dead singleton would authenticate as live. A spent coin whose spend
+/// cannot be served is a "could not answer", so it fails closed.
 fn read_spend_of<S: ChainSource>(
     source: &S,
     coin: Coin,
+    spent_height: Option<u32>,
 ) -> Result<Option<CoinSpend>, LineageWalkError<S::Error>> {
     let Some(spend) = source
         .coin_spend(coin.coin_id())
         .map_err(LineageWalkError::Source)?
     else {
-        return Ok(None);
+        return match spent_height {
+            Some(height) => Err(LineageWalkError::Malformed(format!(
+                "coin {} is recorded as spent at height {height}, but the source served no spend \
+                 for it",
+                coin.coin_id()
+            ))),
+            None => Ok(None),
+        };
     };
     if spend.coin != coin {
         return Err(LineageWalkError::Malformed(format!(
@@ -308,22 +366,27 @@ fn read_spend_of<S: ChainSource>(
     Ok(Some(spend))
 }
 
-/// Requires `coin` to be known to the source, binding a derived successor to real chain state.
+/// Requires `coin` to be known to the source, binding a derived successor to real chain state, and
+/// returns that coin's record.
+///
+/// Equality is over the whole [`Coin`], so a source cannot satisfy the check with a different coin
+/// that merely shares an id-shaped field. The record travels back to the caller because the next
+/// hop needs its `spent_height` (see [`read_spend_of`]) — this is the same read either way, so
+/// nothing extra is asked of the source.
 fn require_coin_exists<S: ChainSource>(
     source: &S,
     coin: Coin,
-) -> Result<(), LineageWalkError<S::Error>> {
-    let known = source
+) -> Result<CoinRecord, LineageWalkError<S::Error>> {
+    source
         .coin_record(coin.coin_id())
         .map_err(LineageWalkError::Source)?
-        .is_some_and(|record| record.coin == coin);
-    if !known {
-        return Err(LineageWalkError::Malformed(format!(
-            "the spend claims to create coin {}, which the source does not know",
-            coin.coin_id()
-        )));
-    }
-    Ok(())
+        .filter(|record| record.coin == coin)
+        .ok_or_else(|| {
+            LineageWalkError::Malformed(format!(
+                "the spend claims to create coin {}, which the source does not know",
+                coin.coin_id()
+            ))
+        })
 }
 
 /// Reconstructs the eve singleton a launcher spend creates.
@@ -418,20 +481,31 @@ fn run_for_continuation<E>(
 
     let mut recreation: Option<(Bytes32, u64)> = None;
     for condition in conditions {
-        let Ok((opcode, (puzzle_hash, (signed_amount, _memos)))) =
-            CreateCoin::from_clvm(allocator, condition)
-        else {
+        // Decode the OPCODE first and the arguments separately. Skipping a condition that fails to
+        // decode as a whole would turn an unparseable CREATE_COIN — or one whose amount overflows
+        // `i64` — into a silent "no successor", i.e. a phantom melt: the walk would stop early and
+        // report a superseded coin as the tip. Once a condition is known to be a CREATE_COIN, an
+        // argument list the walk cannot read is a refusal, never an omission.
+        let Ok((opcode, arguments)) = ConditionHead::from_clvm(allocator, condition) else {
             continue;
         };
         if opcode != CREATE_COIN {
             continue;
         }
+        let (puzzle_hash, (signed_amount, _memos)) =
+            CreateCoinArguments::from_clvm(allocator, arguments).map_err(|error| {
+                LineageWalkError::Malformed(format!("undecodable CREATE_COIN condition: {error}"))
+            })?;
+
         if signed_amount == SINGLETON_MELT_AMOUNT {
             return Ok(Continuation::Ends);
         }
-        let Ok(amount) = u64::try_from(signed_amount) else {
-            continue;
-        };
+        let amount = u64::try_from(signed_amount).map_err(|_| {
+            LineageWalkError::Malformed(format!(
+                "CREATE_COIN with the negative amount {signed_amount}, which is not the singleton \
+                 melt marker {SINGLETON_MELT_AMOUNT}"
+            ))
+        })?;
         if amount % 2 == 0 {
             continue;
         }
@@ -452,10 +526,14 @@ fn run_for_continuation<E>(
 /// The CLVM opcode for `CREATE_COIN`.
 const CREATE_COIN: i64 = 51;
 
-/// A `CREATE_COIN` condition decoded with a SIGNED amount, so the melt marker survives (see
-/// [`run_for_continuation`]): `(opcode, (puzzle_hash, (amount, memos)))`. Any condition with a
-/// different shape simply fails to decode and is skipped.
-type CreateCoin = (i64, (Bytes32, (i64, NodePtr)));
+/// Any condition, split into its opcode and its still-undecoded arguments: `(opcode . arguments)`.
+/// A condition whose opcode is not even an integer is not `CREATE_COIN` and is skipped.
+type ConditionHead = (i64, NodePtr);
+
+/// A `CREATE_COIN`'s arguments decoded with a SIGNED amount, so the melt marker survives (see
+/// [`run_for_continuation`]): `(puzzle_hash, (amount, memos))`. Decoded only AFTER the opcode is
+/// known to be `CREATE_COIN`, so a failure here is a refusal rather than a skip.
+type CreateCoinArguments = (Bytes32, (i64, NodePtr));
 
 /// Deserializes a spend's puzzle reveal and solution into `allocator`.
 fn parse_spend<E>(
@@ -479,4 +557,35 @@ fn program_tree_hash<E>(program: &Program) -> Result<TreeHash, LineageWalkError<
     let mut allocator = Allocator::new();
     let ptr = alloc(&mut allocator, program)?;
     Ok(tree_hash(&allocator, ptr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cycle guard, pinned at the only level it can be: no end-to-end fixture can reach it.
+    ///
+    /// A successor's `parent_coin_info` is always the CURRENT coin's id, and
+    /// [`require_coin_exists`] binds the successor to a real record by full [`Coin`] equality — so
+    /// a member could only repeat if two distinct hops produced the same coin id, i.e. a SHA-256
+    /// collision. The guard is therefore unreachable defense-in-depth today, and stays because a
+    /// future hop rule must not be able to loop silently.
+    #[test]
+    fn admitting_the_same_coin_twice_is_refused_as_a_cycle() {
+        let coin_id = Bytes32::new([0x5A; 32]);
+        let mut members = BTreeSet::new();
+
+        assert_eq!(
+            admit_member::<ChainSourceError>(&mut members, coin_id),
+            Ok(())
+        );
+
+        let repeat = admit_member::<ChainSourceError>(&mut members, coin_id)
+            .expect_err("a repeated coin is a cycle");
+        assert_eq!(
+            repeat,
+            LineageWalkError::Malformed(format!("coin {coin_id} repeats in the lineage (a cycle)"))
+        );
+        assert_eq!(members.len(), 1);
+    }
 }

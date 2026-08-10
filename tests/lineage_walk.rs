@@ -689,7 +689,10 @@ fn a_spent_launcher_whose_spend_the_source_cannot_serve_is_not_an_absence() {
     // The control: the SAME launcher recorded as UNSPENT is a genuine absence, so the refusal above
     // is driven by `spent_height`, not merely by the missing spend.
     let unspent = MockChainSource::new().with_coin(launcher.coin_id(), record(launcher));
-    assert_eq!(walk_singleton_lineage(&unspent, launcher.coin_id()), Ok(None));
+    assert_eq!(
+        walk_singleton_lineage(&unspent, launcher.coin_id()),
+        Ok(None)
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
