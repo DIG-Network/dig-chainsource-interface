@@ -26,9 +26,9 @@ use chia_sdk_driver::{
 };
 use chia_sdk_test::Simulator;
 use chia_sdk_types::{Condition, Conditions};
-use clvm_utils::TreeHash;
-use clvmr::serde::{node_from_bytes, node_to_bytes_backrefs};
-use clvmr::Allocator;
+use clvm_utils::{tree_hash, TreeHash};
+use clvmr::serde::{node_from_bytes, node_to_bytes, node_to_bytes_backrefs};
+use clvmr::{Allocator, NodePtr};
 use dig_chainsource_interface::{
     walk_singleton_lineage, walk_singleton_lineage_bounded, ChainSource, ChainSourceError,
     CoinRecord, LineageWalkError, MockChainSource, SingletonLineage,
@@ -608,22 +608,102 @@ fn exceeding_the_hop_bound_refuses_rather_than_truncating() -> Result<()> {
     Ok(())
 }
 
+/// The spend a source serves must be the spend of the coin it was ASKED for.
+///
+/// The fixture deliberately hands over a spend that is otherwise beyond reproach: the reveal is the
+/// genuine launcher puzzle, so it hashes correctly, and the solution mints an eve the source knows.
+/// Every other guard is therefore satisfied, and only the coin-identity check stands between the
+/// walk and a lineage assembled from another coin's history. A fixture whose reveal did not hash
+/// correctly would be refused by the reveal check instead, and would pin nothing.
 #[test]
 fn a_spend_of_the_wrong_coin_fails_closed() {
     let launcher_ph = Bytes32::new(chia_puzzles::SINGLETON_LAUNCHER_HASH);
-    let launcher = Coin::new(Bytes32::new([0x01; 32]), launcher_ph, 1);
+    let asked_for = Coin::new(Bytes32::new([0x01; 32]), launcher_ph, 1);
     let other = Coin::new(Bytes32::new([0x02; 32]), launcher_ph, 1);
+    let eve_puzzle_hash = Bytes32::new([0x0B; 32]);
+    let eve = Coin::new(asked_for.coin_id(), eve_puzzle_hash, 1);
 
     let source = MockChainSource::new()
-        .with_coin(launcher.coin_id(), record(launcher))
+        .with_coin(asked_for.coin_id(), record(asked_for))
+        .with_coin(eve.coin_id(), record(eve))
         .with_spend(
-            launcher.coin_id(),
-            CoinSpend::new(other, Program::from(vec![0x01]), Program::from(vec![0x80])),
+            asked_for.coin_id(),
+            CoinSpend::new(
+                other,
+                launcher_reveal(),
+                launcher_solution(eve_puzzle_hash, 1),
+            ),
         );
 
-    let error = walk_singleton_lineage(&source, launcher.coin_id())
+    let error = walk_singleton_lineage(&source, asked_for.coin_id())
         .expect_err("a mismatched spend must fail closed");
-    assert!(matches!(error, LineageWalkError::Malformed(_)));
+    assert_eq!(
+        error,
+        LineageWalkError::Malformed(format!(
+            "source returned a spend of coin {} when asked for {}",
+            other.coin_id(),
+            asked_for.coin_id()
+        )),
+        "the refusal must be the coin-identity check, not some other guard that also says Malformed"
+    );
+
+    // The control: the SAME spend, correctly attributed, resolves — so the refusal above is the
+    // identity check biting rather than a fixture that could never have worked.
+    let honest = MockChainSource::new()
+        .with_coin(asked_for.coin_id(), record(asked_for))
+        .with_coin(eve.coin_id(), record(eve))
+        .with_spend(
+            asked_for.coin_id(),
+            CoinSpend::new(
+                asked_for,
+                launcher_reveal(),
+                launcher_solution(eve_puzzle_hash, 1),
+            ),
+        );
+    assert_eq!(
+        walk_singleton_lineage(&honest, asked_for.coin_id())
+            .expect("the honest launcher resolves")
+            .expect("a launched singleton")
+            .tip(),
+        eve.coin_id()
+    );
+}
+
+/// A SPENT coin that is not a launcher is still a genuine absence, and this is the only fixture
+/// shape that can say so.
+///
+/// [`a_coin_that_is_not_a_launcher_is_a_genuine_absence`] uses an UNSPENT ordinary coin, so its
+/// `Ok(None)` arrives whether the launcher puzzle-hash check exists or not: without the check the
+/// walk simply finds no spend and returns the at-launcher `None`. Only a coin that IS spent — and
+/// whose spend would otherwise mint a perfectly good eve — distinguishes the two, and answering
+/// `Ok(Some(_))` for it would report an ordinary two-coin payment chain as a singleton lineage.
+#[test]
+fn a_spent_coin_that_is_not_a_launcher_is_still_a_genuine_absence() {
+    // `(q . ((51 <eve_ph> 1)))` — a puzzle that mints one odd-amount child for any solution.
+    let eve_puzzle_hash = Bytes32::new([0x0A; 32]);
+    let reveal = quoting_puzzle(&vec![(51, (eve_puzzle_hash, (1, ())))]);
+    let ordinary = Coin::new(Bytes32::new([0x09; 32]), tree_hash_of(&reveal), 1);
+    let eve = Coin::new(ordinary.coin_id(), eve_puzzle_hash, 1);
+
+    // The fixture only distinguishes anything if the coin genuinely is not a launcher.
+    assert_ne!(
+        ordinary.puzzle_hash,
+        Bytes32::new(chia_puzzles::SINGLETON_LAUNCHER_HASH)
+    );
+
+    let source = MockChainSource::new()
+        .with_coin(ordinary.coin_id(), spent_record(ordinary, 7))
+        .with_coin(eve.coin_id(), record(eve))
+        .with_spend(
+            ordinary.coin_id(),
+            CoinSpend::new(ordinary, reveal, Program::from(vec![0x80])),
+        );
+
+    assert_eq!(
+        walk_singleton_lineage(&source, ordinary.coin_id()),
+        Ok(None),
+        "an ordinary spent coin names no singleton, however well its spend reads"
+    );
 }
 
 #[test]
@@ -907,6 +987,108 @@ fn an_unspent_eve_is_the_tip_of_a_two_coin_lineage() -> Result<()> {
     assert_eq!(lineage.len(), 2);
     assert!(lineage.contains(singleton.launcher_id));
     Ok(())
+}
+
+/// A coin on the walk whose reveal parses as a perfectly good singleton — of a DIFFERENT launcher.
+///
+/// This is the only shape that reaches the curried-launcher-id check. Every other non-singleton
+/// fixture (an ordinary p2 eve, say) is refused one step earlier, when the reveal fails to parse as
+/// a singleton layer at all — so `an_eve_that_is_not_a_singleton_fails_closed` fires through a
+/// different branch and leaves this guard untouched.
+///
+/// Admitting such a coin would let anyone extend a victim's lineage with their own singleton's
+/// history: the curried launcher id is the only thing tying a well-formed singleton to the launcher
+/// under resolution.
+#[test]
+fn a_singleton_curried_to_a_different_launcher_is_not_a_member() -> Result<()> {
+    let ctx = &mut SpendContext::new();
+    let victim = Coin::new(
+        Bytes32::new([0x0E; 32]),
+        Bytes32::new(chia_puzzles::SINGLETON_LAUNCHER_HASH),
+        1,
+    );
+    let foreign_launcher_id = Bytes32::new([0xFE; 32]);
+
+    // A genuine singleton top layer, curried to somebody else's launcher, wrapping an inner puzzle
+    // that recreates itself — so with the guard removed the walk has a successor to derive.
+    let inner = ctx.alloc(&vec![(51, (Bytes32::new([0x0F; 32]), (1, ())))])?;
+    let quoted_inner = ctx.alloc(&(1, inner))?;
+    let foreign = ctx.curry(SingletonArgs::new(foreign_launcher_id, quoted_inner))?;
+    let eve = Coin::new(victim.coin_id(), Bytes32::from(tree_hash(ctx, foreign)), 1);
+    let eve_solution = ctx.alloc(&SingletonSolution {
+        lineage_proof: Proof::Eve(EveProof {
+            parent_parent_coin_info: victim.parent_coin_info,
+            parent_amount: 1,
+        }),
+        amount: 1,
+        inner_solution: NodePtr::NIL,
+    })?;
+
+    let source = MockChainSource::new()
+        .with_coin(victim.coin_id(), record(victim))
+        .with_coin(eve.coin_id(), spent_record(eve, 8))
+        .with_spend(
+            victim.coin_id(),
+            CoinSpend::new(
+                victim,
+                launcher_reveal(),
+                launcher_solution(eve.puzzle_hash, 1),
+            ),
+        )
+        .with_spend(
+            eve.coin_id(),
+            CoinSpend::new(eve, ctx.serialize(&foreign)?, ctx.serialize(&eve_solution)?),
+        );
+
+    // The fixture is only distinguishing if the reveal really does parse as a singleton — otherwise
+    // this would re-test the parse failure that `an_eve_that_is_not_a_singleton_fails_closed` covers.
+    assert!(
+        SingletonLayer::<chia_sdk_driver::Puzzle>::parse_puzzle(
+            ctx,
+            chia_sdk_driver::Puzzle::parse(ctx, foreign)
+        )?
+        .is_some_and(|layer| layer.launcher_id == foreign_launcher_id),
+        "the reveal must be a well-formed singleton of the OTHER launcher"
+    );
+
+    assert_eq!(
+        walk_singleton_lineage(&source, victim.coin_id()),
+        Err(LineageWalkError::NotASingleton {
+            coin_id: eve.coin_id()
+        }),
+        "a singleton of another launcher must be refused as such, not derived from"
+    );
+    Ok(())
+}
+
+/// The well-known singleton launcher puzzle, serialized.
+fn launcher_reveal() -> Program {
+    Program::from(chia_puzzles::SINGLETON_LAUNCHER.to_vec())
+}
+
+/// A launcher solution minting an eve at `puzzle_hash` for `amount`, with no key-value list.
+fn launcher_solution(puzzle_hash: Bytes32, amount: u64) -> Program {
+    serialized(&(puzzle_hash, (amount, (Vec::<Bytes32>::new(), ()))))
+}
+
+/// `(q . conditions)` — a puzzle that emits `conditions` verbatim whatever its solution.
+fn quoting_puzzle<T: clvm_traits::ToClvm<Allocator>>(conditions: &T) -> Program {
+    serialized(&(1, conditions))
+}
+
+/// The CLVM tree hash of a serialized program.
+fn tree_hash_of(program: &Program) -> Bytes32 {
+    let mut allocator = Allocator::new();
+    let node = node_from_bytes(&mut allocator, program.as_ref()).expect("the program deserializes");
+    Bytes32::from(tree_hash(&allocator, node))
+}
+
+/// Serializes `value` to a [`Program`].
+fn serialized<T: clvm_traits::ToClvm<Allocator>>(value: &T) -> Program {
+    let mut allocator = Allocator::new();
+    let node =
+        clvm_traits::ToClvm::to_clvm(value, &mut allocator).expect("the value always allocates");
+    Program::from(node_to_bytes(&allocator, node).expect("the value always serializes"))
 }
 
 fn record(coin: Coin) -> CoinRecord {

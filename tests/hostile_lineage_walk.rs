@@ -294,9 +294,22 @@ fn a_short_honest_walk_finishes_well_inside_its_budget() -> Result<()> {
 /// `cargo test --release --features lineage-walk,testing --test hostile_lineage_walk -- --ignored
 /// --nocapture` to re-measure the cost of the hostile chain at the DEFAULT hop bound.
 ///
-/// It is `#[ignore]`d because exhausting 100,000 hops takes tens of seconds, which does not belong in
-/// every CI run — but it compiles on every run, so it cannot silently rot. The number that matters is
-/// peak working set: an allocator shared across hops never frees, so it grows with the chain.
+/// # Why the per-hop allocator is not pinned by a RUNNING assertion
+///
+/// Exhausting the arena costs roughly a fixed number of CLVM pair allocations however the fixture is
+/// shaped, so any test that observes the difference must pay it: ~6s in release and far longer in a
+/// debug CI run. A peak-working-set assertion would be cheaper and is worse — peak working set is
+/// monotonic per process, so a sibling test that had already raised it would make the delta zero and
+/// the assertion vacuously green.
+///
+/// The reset is therefore pinned STRUCTURALLY instead: `successor_of` owns its allocator as a local,
+/// so nothing above it holds one to hoist. Restoring the defect means changing that function's
+/// signature and its call site, not deleting a line. This measurement is the empirical backstop, and
+/// it compiles on every run so it cannot silently rot.
+///
+/// Measured on this fixture: **28.9 MB** peak and `TooDeep { limit: 100000 }` with the per-hop
+/// allocator, against **276.5 MB** and `Malformed("too many pairs")` with it hoisted — the documented
+/// hop bound unreachable, and the failure misattributed to the source.
 #[test]
 #[ignore = "a multi-second DoS measurement, not a correctness gate"]
 fn measure_the_cost_of_the_default_hop_bound() -> Result<()> {
