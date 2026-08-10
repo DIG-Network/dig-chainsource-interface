@@ -383,10 +383,14 @@ enum HopRule {
 /// A [`clvmr::Allocator`] is an arena: it allocates monotonically and frees nothing until it is
 /// dropped. An allocator hoisted outside the walk's loop therefore accumulates every hop's puzzle,
 /// solution and evaluation for the whole walk, so a hostile source's ever-advancing chain buys
-/// unbounded memory alongside unbounded time — measured at 552 MB over 100,000 hops, against 24 MB
-/// when each hop starts clean. Worse, the arena's own node ceiling is reached before
-/// [`MAX_LINEAGE_DEPTH`] is, so the walk fails as [`LineageWalkError::Malformed`] — accusing an
-/// honest source of serving inconsistent chain data when the truth is that the walk ran out of room.
+/// unbounded memory alongside unbounded time. Measured over the endless chain in
+/// `tests/hostile_lineage_walk.rs`, hoisting the allocator costs **276.5 MB** of peak working set
+/// against **28.9 MB** when each hop starts clean. Worse, the arena's own node ceiling is reached
+/// well BEFORE [`MAX_LINEAGE_DEPTH`] is, so the hoisted walk never reaches its documented
+/// [`LineageWalkError::TooDeep`] refusal and fails as [`LineageWalkError::Malformed`] instead —
+/// accusing an honest source of serving inconsistent chain data when the truth is that the walk ran
+/// out of room. A long-lived singleton with tens of thousands of states would be libelled the same
+/// way.
 ///
 /// Owning the allocator inside this function is what makes that unhoistable: nothing above it holds
 /// one, so the per-hop reset cannot be quietly undone by moving a line.
