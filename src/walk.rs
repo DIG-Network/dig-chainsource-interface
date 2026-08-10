@@ -498,6 +498,9 @@ fn run_for_continuation<E>(
                 LineageWalkError::Malformed(format!("undecodable CREATE_COIN condition: {error}"))
             })?;
 
+        // The AMOUNT decides what the puzzle hash has to be, so it is read first. A melt's puzzle
+        // hash is canonically NIL and an odd recreation's is a 32-byte address; demanding 32 bytes
+        // up front would refuse every melt standard tooling emits (see `CreateCoinArguments`).
         if signed_amount == SINGLETON_MELT_AMOUNT {
             return Ok(Continuation::Ends);
         }
@@ -510,6 +513,13 @@ fn run_for_continuation<E>(
         if amount % 2 == 0 {
             continue;
         }
+        // Now — and only now — the condition is known to address a coin the walk must follow, so
+        // an unreadable puzzle hash is a refusal rather than an omission.
+        let puzzle_hash = Bytes32::from_clvm(allocator, puzzle_hash).map_err(|error| {
+            LineageWalkError::Malformed(format!(
+                "undecodable CREATE_COIN condition: recreation puzzle hash: {error}"
+            ))
+        })?;
         if recreation.is_some() {
             return Err(LineageWalkError::Malformed(
                 "a singleton spend emitted more than one odd-amount child".to_string(),
@@ -534,7 +544,16 @@ type ConditionHead = (i64, NodePtr);
 /// A `CREATE_COIN`'s arguments decoded with a SIGNED amount, so the melt marker survives (see
 /// [`run_for_continuation`]): `(puzzle_hash, (amount, memos))`. Decoded only AFTER the opcode is
 /// known to be `CREATE_COIN`, so a failure here is a refusal rather than a skip.
-type CreateCoinArguments = (Bytes32, (i64, NodePtr));
+///
+/// # Why the puzzle hash stays a raw [`NodePtr`] here
+///
+/// The canonical chia melt condition is `(51 () -113)` — a NIL puzzle hash. `chia_sdk_types`
+/// declares it that way (`MeltSingleton { puzzle_hash: () if () }`), and it is what every melt
+/// built by standard chia-wallet-sdk tooling carries. Demanding [`Bytes32`] as part of THIS decode
+/// would therefore refuse the canonical melt outright, making any singleton melted with standard
+/// tooling permanently unanswerable. The amount is the discriminant, so the hash is resolved only
+/// once the amount proves the condition is an odd-amount recreation.
+type CreateCoinArguments = (NodePtr, (i64, NodePtr));
 
 /// Deserializes a spend's puzzle reveal and solution into `allocator`.
 fn parse_spend<E>(

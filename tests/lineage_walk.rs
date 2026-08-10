@@ -406,20 +406,16 @@ fn an_unsupported_read_stays_distinguishable_from_unreadable_and_from_absent() {
     assert_ne!(projected, ChainSourceError::Malformed("coin_record".into()));
 }
 
-#[test]
-fn a_melted_singleton_has_no_lineage() -> Result<()> {
-    let mut sim = Simulator::new();
-    let ctx = &mut SpendContext::new();
-    let mut singleton = launch(&mut sim, ctx)?;
-
-    // Melt: spend the eve emitting NO odd-amount successor.
+/// Spends the singleton's tip with `melt`, a condition list that emits no singleton recreation.
+fn melt_with(
+    sim: &mut Simulator,
+    ctx: &mut SpendContext,
+    singleton: &Singleton,
+    melt: Conditions,
+) -> Result<()> {
     let tip = singleton.tip();
     let sk = singleton.sk.clone();
-    // A melt is an odd-amount CREATE_COIN with the singleton melt marker (-113), which the top
-    // layer turns into an ORDINARY coin — so the singleton emits no successor and ceases to exist.
-    let melt = ctx.alloc(&(51, (singleton.inner_puzzle_hash, (-113, ()))))?;
-    let inner = StandardLayer::new(singleton.pk)
-        .spend_with_conditions(ctx, Conditions::new().with(Condition::Other(melt)))?;
+    let inner = StandardLayer::new(singleton.pk).spend_with_conditions(ctx, melt)?;
     let layer = SingletonLayer::new(singleton.launcher_id, StandardLayer::new(singleton.pk));
     let puzzle = layer.construct_puzzle(ctx)?;
     let solution = ctx.alloc(&SingletonSolution {
@@ -429,10 +425,72 @@ fn a_melted_singleton_has_no_lineage() -> Result<()> {
     })?;
     ctx.spend(tip, Spend::new(puzzle, solution))?;
     sim.spend_coins(ctx.take(), std::slice::from_ref(&sk))?;
+    Ok(())
+}
 
-    singleton.trail.push(tip);
+/// A melt whose `CREATE_COIN` names a 32-byte puzzle hash alongside the `-113` marker: the top
+/// layer turns that output into an ORDINARY coin, so the singleton emits no successor.
+#[test]
+fn a_melted_singleton_has_no_lineage() -> Result<()> {
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+    let singleton = launch(&mut sim, ctx)?;
+
+    let melt = ctx.alloc(&(51, (singleton.inner_puzzle_hash, (-113, ()))))?;
+    melt_with(
+        &mut sim,
+        ctx,
+        &singleton,
+        Conditions::new().with(Condition::Other(melt)),
+    )?;
+
     let src = source(&sim);
     assert_eq!(walk_singleton_lineage(&src, singleton.launcher_id)?, None);
+    Ok(())
+}
+
+/// The melt the ECOSYSTEM actually emits: `Conditions::melt_singleton()`, whose `CREATE_COIN`
+/// carries a **NIL** puzzle hash (`chia_sdk_types` declares `MeltSingleton { puzzle_hash: () }`).
+///
+/// This is the form `dig-did` and `chip35_dl_coin` produce, because they build spends with
+/// standard chia-wallet-sdk tooling. A walk that decodes the puzzle hash before testing the melt
+/// marker refuses it, and the melted singleton then reports "the chain data is inconsistent"
+/// forever — a dead identity that can never be resolved as dead, with an honest source blamed.
+/// The 32-byte fixture above cannot express this; that is precisely why both exist.
+#[test]
+fn a_singleton_melted_with_standard_tooling_has_no_lineage() -> Result<()> {
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+    let singleton = launch(&mut sim, ctx)?;
+
+    melt_with(
+        &mut sim,
+        ctx,
+        &singleton,
+        Conditions::new().melt_singleton(),
+    )?;
+
+    // The fixture is only distinguishing if the melt really carries a NIL puzzle hash: serialized,
+    // `(51 () -113)` is `ff 33 ff 80 ff 81 8f 80`. A fixture that quietly emitted a 32-byte hash
+    // would duplicate the test above and prove nothing.
+    const CANONICAL_MELT: [u8; 8] = [0xff, 0x33, 0xff, 0x80, 0xff, 0x81, 0x8f, 0x80];
+    let spend = sim
+        .coin_spend(singleton.tip().coin_id())
+        .expect("the melt spend is on chain");
+    assert!(
+        spend
+            .solution
+            .as_ref()
+            .windows(CANONICAL_MELT.len())
+            .any(|window| window == CANONICAL_MELT),
+        "the standard melt must serialize its CREATE_COIN with a nil puzzle hash"
+    );
+
+    assert_eq!(
+        walk_singleton_lineage(&source(&sim), singleton.launcher_id)?,
+        None,
+        "a singleton melted with standard tooling is a genuine absence, not a refusal"
+    );
     Ok(())
 }
 
