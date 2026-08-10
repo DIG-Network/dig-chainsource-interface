@@ -451,6 +451,7 @@ fn singleton_successor<E>(
 const SINGLETON_MELT_AMOUNT: i64 = -113;
 
 /// What running a spend's puzzle says about the singleton's continuation.
+#[derive(Debug)]
 enum Continuation {
     /// The spend recreates the singleton as `(inner_or_full_puzzle_hash, amount)`.
     Recreates(Bytes32, u64),
@@ -587,5 +588,101 @@ mod tests {
             LineageWalkError::Malformed(format!("coin {coin_id} repeats in the lineage (a cycle)"))
         );
         assert_eq!(members.len(), 1);
+    }
+
+    /// Quotes `value` so [`run_puzzle`] returns it verbatim, letting a test hand
+    /// [`run_for_continuation`] a condition list the simulator would never mint — the CLVM
+    /// validator rejects a malformed condition, so the only place this shape is reachable is a
+    /// LYING source, which is exactly the case under test.
+    fn quoting(allocator: &mut Allocator, value: NodePtr) -> NodePtr {
+        let quote = allocator.one();
+        allocator
+            .new_pair(quote, value)
+            .expect("a two-node pair always allocates")
+    }
+
+    /// Allocates the condition list `conditions`.
+    fn condition_list(allocator: &mut Allocator, conditions: Vec<NodePtr>) -> NodePtr {
+        conditions
+            .to_clvm(allocator)
+            .expect("a condition list always allocates")
+    }
+
+    fn continuation_of(
+        allocator: &mut Allocator,
+        conditions: Vec<NodePtr>,
+    ) -> Result<Continuation, LineageWalkError<ChainSourceError>> {
+        let list = condition_list(allocator, conditions);
+        let puzzle = quoting(allocator, list);
+        run_for_continuation(allocator, puzzle, NodePtr::NIL)
+    }
+
+    /// A CREATE_COIN the walk cannot decode must REFUSE, not be skipped.
+    ///
+    /// Skipping it leaves the spend looking like it emitted no odd-amount child, which the walk
+    /// reads as a melt — a phantom one. The lineage would then stop early and report a superseded
+    /// coin as the tip: the same not-known-presenting-as-a-tip defect as an unreadable spend,
+    /// arrived at through the condition decoder.
+    #[test]
+    fn an_undecodable_create_coin_refuses_rather_than_reading_as_a_melt() {
+        let allocator = &mut Allocator::new();
+        let opcode = CREATE_COIN
+            .to_clvm(allocator)
+            .expect("the opcode allocates");
+        // `(51)` — a CREATE_COIN with no puzzle hash and no amount at all.
+        let truncated = allocator
+            .new_pair(opcode, NodePtr::NIL)
+            .expect("the condition allocates");
+
+        let error = continuation_of(allocator, vec![truncated])
+            .expect_err("an undecodable CREATE_COIN is not a melt");
+        assert!(
+            matches!(error, LineageWalkError::Malformed(detail) if detail.contains("CREATE_COIN")),
+            "the refusal must name the condition it could not read"
+        );
+    }
+
+    /// A negative amount that is NOT the melt marker is nonsense the walk must refuse, for the same
+    /// reason: silently dropping it invents a melt.
+    #[test]
+    fn a_negative_non_melt_amount_refuses() {
+        let allocator = &mut Allocator::new();
+        let condition = (CREATE_COIN, (Bytes32::new([0x0C; 32]), (-7i64, ())))
+            .to_clvm(allocator)
+            .expect("the condition allocates");
+
+        let error = continuation_of(allocator, vec![condition])
+            .expect_err("a negative non-melt amount is not a melt");
+        assert!(matches!(error, LineageWalkError::Malformed(_)));
+    }
+
+    /// The control the two refusals above need: WELL-FORMED conditions still decode exactly as
+    /// before, so the strictness bites only on what the walk genuinely cannot read.
+    ///
+    /// Without this, a `run_for_continuation` that refused everything would pass both tests.
+    #[test]
+    fn well_formed_conditions_still_decode_as_melt_and_as_recreation() {
+        let allocator = &mut Allocator::new();
+        let puzzle_hash = Bytes32::new([0x0D; 32]);
+
+        let melt = (CREATE_COIN, (puzzle_hash, (SINGLETON_MELT_AMOUNT, ())))
+            .to_clvm(allocator)
+            .expect("the condition allocates");
+        assert!(matches!(
+            continuation_of(allocator, vec![melt]),
+            Ok(Continuation::Ends)
+        ));
+
+        let payment = (CREATE_COIN, (puzzle_hash, (2i64, ())))
+            .to_clvm(allocator)
+            .expect("the condition allocates");
+        let recreate = (CREATE_COIN, (puzzle_hash, (3i64, ())))
+            .to_clvm(allocator)
+            .expect("the condition allocates");
+        // The even-amount payment is an ordinary output and must still be ignored, not refused.
+        assert!(matches!(
+            continuation_of(allocator, vec![payment, recreate]),
+            Ok(Continuation::Recreates(hash, 3)) if hash == puzzle_hash
+        ));
     }
 }
