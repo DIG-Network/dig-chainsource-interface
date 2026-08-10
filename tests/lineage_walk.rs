@@ -45,12 +45,21 @@ struct SimSource<'a> {
     /// the child list hands a source the power to steer the lineage (see
     /// [`a_genuine_sibling_of_the_successor_is_not_selected_as_the_successor`]).
     children_reads: Cell<usize>,
+    /// A coin whose SPEND this source withholds while still reporting the coin as spent — an
+    /// otherwise honest source that has simply lost one spend (a pruned node, a partial index).
+    withheld_spend: Option<Bytes32>,
+    /// A coin whose RECORD this source withholds, so a derived successor cannot be bound to real
+    /// chain state. Drives [`require_coin_exists`]'s guard.
+    withheld_record: Option<Bytes32>,
 }
 
 impl ChainSource for SimSource<'_> {
     type Error = ChainSourceError;
 
     fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        if self.withheld_record == Some(coin_id) {
+            return Ok(None);
+        }
         Ok(self.sim.coin_state(coin_id).map(CoinRecord::from))
     }
 
@@ -83,6 +92,9 @@ impl ChainSource for SimSource<'_> {
     }
 
     fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        if self.withheld_spend == Some(coin_id) {
+            return Ok(None);
+        }
         Ok(self.sim.coin_spend(coin_id))
     }
 
@@ -214,6 +226,8 @@ fn source(sim: &Simulator) -> SimSource<'_> {
     SimSource {
         sim,
         children_reads: Cell::new(0),
+        withheld_spend: None,
+        withheld_record: None,
     }
 }
 
@@ -604,6 +618,157 @@ fn every_failure_reports_itself_distinguishably() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// A spend the source cannot serve is UNKNOWN, never a tip (the `Ok(None)` ambiguity).
+// ---------------------------------------------------------------------------------------------
+
+/// `ChainSource::coin_spend` returns `Ok(None)` for "unspent OR unknown", and only the coin's own
+/// `spent_height` tells the two apart. A walk that conflates them reports the last coin it could
+/// read as the unspent tip.
+///
+/// Here the chain is launcher -> eve -> C2 -> C3 and the source is honest about every coin's
+/// record — it has simply lost C2's spend, as a pruned or partially-indexed node would. C2 is
+/// therefore recorded as SPENT while its spend reads as absent. Answering `C2` as the tip would
+/// assert that a superseded state is current; the walk must refuse instead.
+#[test]
+fn a_spent_coin_whose_spend_the_source_cannot_serve_is_never_reported_as_the_tip() -> Result<()> {
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+    let mut singleton = launch(&mut sim, ctx)?;
+    advance(&mut sim, ctx, &mut singleton)?;
+    advance(&mut sim, ctx, &mut singleton)?;
+
+    let stale = singleton.trail[2];
+    let tip = singleton.tip();
+
+    // The fixture only distinguishes anything if C2 really is spent and really is NOT the tip.
+    let spent_state = sim.coin_state(stale.coin_id()).expect("C2 is on chain");
+    assert!(
+        spent_state.spent_height.is_some(),
+        "C2 must be spent for the ambiguity to exist"
+    );
+    assert_ne!(stale.coin_id(), tip.coin_id());
+
+    let mut src = source(&sim);
+    src.withheld_spend = Some(stale.coin_id());
+
+    let error = walk_singleton_lineage(&src, singleton.launcher_id)
+        .expect_err("a spend the source cannot serve is an unknown, not a tip");
+    assert!(
+        matches!(error, LineageWalkError::Malformed(_)),
+        "expected a refusal, got {error:?}"
+    );
+
+    // And the honest control: with the same source telling the whole truth, the walk resolves.
+    let honest = source(&sim);
+    assert_eq!(
+        walk_singleton_lineage(&honest, singleton.launcher_id)?
+            .expect("the honest chain resolves")
+            .tip(),
+        tip.coin_id(),
+    );
+    Ok(())
+}
+
+/// The same ambiguity at the LAUNCHER degrades an unknown into "this singleton never existed" —
+/// the SPEC §3 violation, and the one that reads as a genuine absence rather than a stale tip.
+#[test]
+fn a_spent_launcher_whose_spend_the_source_cannot_serve_is_not_an_absence() {
+    let launcher_ph = Bytes32::new(chia_puzzles::SINGLETON_LAUNCHER_HASH);
+    let launcher = Coin::new(Bytes32::new([0x08; 32]), launcher_ph, 1);
+
+    let source = MockChainSource::new().with_coin(launcher.coin_id(), spent_record(launcher, 12));
+
+    let error = walk_singleton_lineage(&source, launcher.coin_id())
+        .expect_err("a spent launcher with no readable spend is unknown, not unlaunched");
+    assert!(
+        matches!(error, LineageWalkError::Malformed(_)),
+        "expected a refusal, got {error:?}"
+    );
+
+    // The control: the SAME launcher recorded as UNSPENT is a genuine absence, so the refusal above
+    // is driven by `spent_height`, not merely by the missing spend.
+    let unspent = MockChainSource::new().with_coin(launcher.coin_id(), record(launcher));
+    assert_eq!(walk_singleton_lineage(&unspent, launcher.coin_id()), Ok(None));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The anti-lying-source guards, each pinned by a test that dies with it.
+// ---------------------------------------------------------------------------------------------
+
+/// SPEC §4a requirement 2: a derived successor must be bound to a real `coin_record`.
+///
+/// A solution is not committed to by the coin's puzzle hash, so a source that pairs a genuine
+/// reveal with a fabricated solution can name any successor it likes. This fixture is the readable
+/// half of that: the successor C2 is derived from a genuine spend, but the source does not admit
+/// the coin exists. Deleting the existence check makes the walk sail past C2 to the real tip and
+/// answer `Ok(Some(..))`, so this test is what keeps the check alive.
+#[test]
+fn a_derived_successor_the_source_does_not_know_fails_closed() -> Result<()> {
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+    let mut singleton = launch(&mut sim, ctx)?;
+    advance(&mut sim, ctx, &mut singleton)?;
+    advance(&mut sim, ctx, &mut singleton)?;
+
+    let unknown = singleton.trail[2];
+    let mut src = source(&sim);
+    src.withheld_record = Some(unknown.coin_id());
+
+    let error = walk_singleton_lineage(&src, singleton.launcher_id)
+        .expect_err("a successor the source does not know must fail closed");
+    match error {
+        LineageWalkError::Malformed(detail) => assert!(
+            detail.contains(&unknown.coin_id().to_string()),
+            "the refusal must name the unknown coin: {detail}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    // The control: without the veil, the very same chain resolves to the real tip — so the failure
+    // above is the guard biting, not a broken fixture.
+    let honest = source(&sim);
+    assert_eq!(
+        walk_singleton_lineage(&honest, singleton.launcher_id)?
+            .expect("the honest chain resolves")
+            .tip(),
+        singleton.tip().coin_id(),
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The documented return table, pinned.
+// ---------------------------------------------------------------------------------------------
+
+/// A launcher spent into an eve that is still UNSPENT resolves to a two-coin lineage whose tip is
+/// the eve — even though the eve's own singleton structure cannot be proven until it is spent.
+///
+/// This is a deliberate, documented limitation, not an oversight: the launcher's `CREATE_COIN`
+/// carries the eve's FULL puzzle hash, which is non-invertible, so nothing but the launcher's own
+/// spender chose it. It fails closed with `NotASingleton` the moment the eve is spent. The test
+/// exists so the documented behaviour is enforced rather than merely described.
+#[test]
+fn an_unspent_eve_is_the_tip_of_a_two_coin_lineage() -> Result<()> {
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+    let singleton = launch(&mut sim, ctx)?;
+
+    let eve = singleton.tip();
+    assert!(
+        sim.coin_spend(eve.coin_id()).is_none(),
+        "the eve must be unspent for this to be the documented case"
+    );
+
+    let src = source(&sim);
+    let lineage =
+        walk_singleton_lineage(&src, singleton.launcher_id)?.expect("a freshly launched singleton");
+    assert_eq!(lineage.tip(), eve.coin_id());
+    assert_eq!(lineage.len(), 2);
+    assert!(lineage.contains(singleton.launcher_id));
+    Ok(())
+}
+
 fn record(coin: Coin) -> CoinRecord {
     CoinRecord {
         coin,
@@ -611,5 +776,14 @@ fn record(coin: Coin) -> CoinRecord {
         spent_height: None,
         timestamp: None,
         coinbase: false,
+    }
+}
+
+/// [`record`] for a coin the source reports as SPENT — the state no fixture could express while
+/// `spent_height` was hardcoded to `None`.
+fn spent_record(coin: Coin, spent_height: u32) -> CoinRecord {
+    CoinRecord {
+        spent_height: Some(spent_height),
+        ..record(coin)
     }
 }
