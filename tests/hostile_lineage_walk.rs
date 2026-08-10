@@ -23,7 +23,8 @@ use chia_puzzle_types::singleton::{SingletonArgs, SingletonSolution};
 use chia_puzzle_types::{EveProof, Proof};
 use chia_sdk_driver::SpendContext;
 use clvm_utils::tree_hash;
-use clvmr::NodePtr;
+use clvmr::serde::{node_from_bytes, node_to_bytes_backrefs};
+use clvmr::{Allocator, NodePtr};
 use dig_chainsource_interface::{
     walk_singleton_lineage_within, ChainSource, ChainSourceError, CoinRecord, LineageWalkError,
     SingletonLineage, WalkBounds,
@@ -37,6 +38,14 @@ const QUOTE: i64 = 1;
 const CREATE_COIN: i64 = 51;
 /// The environment path selecting the FIRST element of the solution.
 const FIRST_SOLUTION_ARG: i64 = 2;
+/// The serialization tag introducing a CLVM back-reference.
+const BACKREF_TAG: u8 = 0xFE;
+
+/// Re-serializes `program` in the compressed, back-reference-bearing form, preserving its tree hash.
+fn compress(ctx: &mut SpendContext, program: &Program) -> Result<Program> {
+    let node = node_from_bytes(ctx, program.as_ref())?;
+    Ok(Program::from(node_to_bytes_backrefs(ctx, node)?))
+}
 
 /// A singleton inner puzzle that recreates the singleton at whatever inner puzzle hash its solution
 /// names: `(c (c (q . 51) (c 2 (c (q . 1) ()))) ())`, i.e. it emits `((51 <solution[0]> 1))`.
@@ -122,6 +131,18 @@ impl HostileSource {
             frontier: RefCell::new(eve),
             reads: Cell::new(0),
         })
+    }
+
+    /// Re-serializes both puzzle reveals in the COMPRESSED, back-reference-bearing form a full node
+    /// emits, leaving every tree hash — and therefore every coin — unchanged.
+    fn with_backref_compressed_reveals(mut self, ctx: &mut SpendContext) -> Result<Self> {
+        self.singleton_reveal = compress(ctx, &self.singleton_reveal)?;
+        assert!(
+            self.singleton_reveal.as_ref().contains(&BACKREF_TAG),
+            "the control is only load-bearing if the reveal really carries a back-reference"
+        );
+        self.launcher_reveal = compress(ctx, &self.launcher_reveal)?;
+        Ok(self)
     }
 
     fn launcher_id(&self) -> Bytes32 {
@@ -332,6 +353,182 @@ fn measure_the_cost_of_the_default_hop_bound() -> Result<()> {
         source.reads.get(),
         peak_working_set_bytes() as f64 / (1024.0 * 1024.0),
         outcome
+    );
+    Ok(())
+}
+
+/// A CLVM **back-reference decompression bomb**: a few dozen bytes that decode into a `depth`-level
+/// self-referential DAG, i.e. a tree of `2^depth` leaves.
+///
+/// Back-references are what make this expressible. The compressed serializer writes a repeated
+/// subtree once and points at it thereafter, so consing a node with ITSELF `depth` times costs about
+/// three bytes per level on the wire while doubling the notional tree at every level. A hash walk
+/// that does not memoize therefore pays `2^depth` hash operations for an input a source can send for
+/// free.
+fn backref_bomb(depth: u32) -> Program {
+    let mut allocator = Allocator::new();
+    let mut node = allocator
+        .new_atom(&[1])
+        .expect("a one-byte atom always fits");
+    for _ in 0..depth {
+        node = allocator
+            .new_pair(node, node)
+            .expect("a self-cons adds one pair");
+    }
+    let bytes = node_to_bytes_backrefs(&allocator, node).expect("the DAG serializes");
+    Program::from(bytes)
+}
+
+/// A source whose launcher record is honest and whose launcher SPEND is a decompression bomb.
+///
+/// This is the cheapest possible attack: the reveal-binding check at the top of the first hop must
+/// hash the reveal BEFORE it can compare it, so a source that never owned a singleton and never
+/// funded a coin can detonate on read.
+struct BombSource {
+    launcher: Coin,
+    bomb: Program,
+}
+
+impl BombSource {
+    fn at_depth(depth: u32) -> Self {
+        Self {
+            launcher: Coin::new(
+                Bytes32::new([0xB0; 32]),
+                Bytes32::new(chia_puzzles::SINGLETON_LAUNCHER_HASH),
+                1,
+            ),
+            bomb: backref_bomb(depth),
+        }
+    }
+}
+
+impl ChainSource for BombSource {
+    type Error = ChainSourceError;
+
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        if coin_id != self.launcher.coin_id() {
+            return Ok(None);
+        }
+        Ok(Some(CoinRecord {
+            coin: self.launcher,
+            confirmed_height: Some(1),
+            spent_height: Some(2),
+            timestamp: None,
+            coinbase: false,
+        }))
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        _puzzle_hash: Bytes32,
+        _include_spent: bool,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    fn coin_records_by_parent(
+        &self,
+        _parent_coin_id: Bytes32,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        if coin_id != self.launcher.coin_id() {
+            return Ok(None);
+        }
+        Ok(Some(CoinSpend::new(
+            self.launcher,
+            self.bomb.clone(),
+            // NIL: the solution is never reached, because the reveal check refuses the spend first.
+            Program::from(vec![0x80]),
+        )))
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        launcher_id: Bytes32,
+    ) -> Result<Option<SingletonLineage>, Self::Error> {
+        dig_chainsource_interface::resolve_singleton_lineage_via_walk(self, launcher_id)
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        Ok(None)
+    }
+
+    fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
+        Ok(None)
+    }
+}
+
+/// A ~74-byte puzzle reveal must not cost minutes of CPU — the reveal hash must be MEMOIZED.
+///
+/// # Why this asserts on the clock and not only on the outcome
+///
+/// The bomb's hash cannot possibly equal the launcher's puzzle hash, so the walk refuses it either
+/// way: the outcome is `Malformed` whether the hash took 151 µs or 140 seconds. Only elapsed time
+/// distinguishes a memoizing hash from a non-memoizing one, so elapsed time is what is asserted.
+///
+/// # Why the wall-clock BUDGET does not cover this
+///
+/// The budget is checked at the top of each hop, before the spend is read. On the first iteration no
+/// time has passed, so the check passes and the hop then runs unbounded — the budget bounds the
+/// NUMBER of hops, never the cost of one.
+///
+/// Measured on this fixture at depth 24 (74 serialized bytes), debug: **140.4 s** with the
+/// non-memoizing `clvm_utils::tree_hash`, **151 µs** with `tree_hash_from_bytes`. The threshold below
+/// sits three orders of magnitude beneath the unfixed cost, so it cannot be met by a slow machine.
+#[test]
+fn a_backref_decompression_bomb_in_a_puzzle_reveal_is_hashed_in_bounded_time() -> Result<()> {
+    let source = BombSource::at_depth(24);
+
+    let started = Instant::now();
+    let error = walk_singleton_lineage_within(
+        &source,
+        source.launcher.coin_id(),
+        // A budget far larger than the threshold asserted below, so the BUDGET cannot be what makes
+        // this test pass — if the hash were unbounded the walk would still be inside its first hop.
+        WalkBounds::hops(4).within(Duration::from_secs(600)),
+    )
+    .expect_err("a reveal that does not hash to the coin's puzzle hash is refused");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(error, LineageWalkError::Malformed(ref message) if message.contains("puzzle reveal")),
+        "the bomb is refused as a reveal that does not match the coin, not by any other guard: \
+         {error:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "hashing a {}-byte reveal must be memoized; it took {elapsed:?}",
+        source.bomb.as_ref().len()
+    );
+    Ok(())
+}
+
+/// The bomb must be refused because it is MEMOIZED, never because back-references were banned again.
+///
+/// Rejecting every back-reference would pass the test above while re-introducing the defect
+/// `node_from_bytes_backrefs` was adopted to fix: a genuine compressed reveal — the form a full node
+/// emits — read as malformed chain data. This is the honest control, and it uses the same
+/// serializer the bomb does.
+#[test]
+fn a_genuinely_backref_compressed_reveal_is_still_accepted() -> Result<()> {
+    let ctx = &mut SpendContext::new();
+    let source = HostileSource::new(ctx)?.with_backref_compressed_reveals(ctx)?;
+
+    // Reaching the hop cap means every reveal along the way HASHED to its coin's puzzle hash, so
+    // the compressed form was read correctly rather than refused.
+    let error = walk_singleton_lineage_within(
+        &source,
+        source.launcher_id(),
+        WalkBounds::hops(4).within(Duration::from_secs(60)),
+    )
+    .expect_err("four hops of an endless chain still exhaust the cap");
+    assert_eq!(
+        error,
+        LineageWalkError::TooDeep { limit: 4 },
+        "a back-reference-compressed reveal must be accepted, not reported as malformed"
     );
     Ok(())
 }

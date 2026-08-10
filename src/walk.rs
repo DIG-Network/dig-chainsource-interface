@@ -46,7 +46,7 @@ use chia_puzzles::SINGLETON_LAUNCHER_HASH;
 use chia_sdk_driver::{Layer, Puzzle, SingletonLayer};
 use chia_sdk_types::run_puzzle;
 use clvm_traits::FromClvm;
-use clvm_utils::{tree_hash, TreeHash};
+use clvm_utils::{tree_hash_from_bytes, TreeHash};
 use clvmr::serde::node_from_bytes_backrefs;
 use clvmr::{Allocator, NodePtr};
 
@@ -716,10 +716,22 @@ fn alloc<E>(allocator: &mut Allocator, program: &Program) -> Result<NodePtr, Lin
 }
 
 /// The CLVM tree hash of a serialized [`Program`], without disturbing the walk's allocator.
+///
+/// # Why the MEMOIZING hasher, and not `clvm_utils::tree_hash`
+///
+/// Back-references (see [`alloc`]) decode to a shared DAG, not a tree: a repeated subtree becomes
+/// one node with many parents. `tree_hash` is a plain stack traversal with no cache, so it re-hashes
+/// every shared node once per path that reaches it — `2^k` hash operations for a `k`-level
+/// self-referential DAG. That makes a ~74-byte puzzle reveal a decompression bomb, and this call
+/// site is the FIRST thing a hop does with attacker-supplied bytes: the reveal must be hashed before
+/// it can be compared to the coin's puzzle hash, so the binding check is what detonates. The
+/// walk's wall-clock budget cannot help, because it is checked between hops rather than inside one.
+///
+/// [`tree_hash_from_bytes`] is back-reference-aware AND memoizing (it hashes each shared node once),
+/// which is why `chia-peer` already uses it for the same job.
 fn program_tree_hash<E>(program: &Program) -> Result<TreeHash, LineageWalkError<E>> {
-    let mut allocator = Allocator::new();
-    let ptr = alloc(&mut allocator, program)?;
-    Ok(tree_hash(&allocator, ptr))
+    tree_hash_from_bytes(program.as_ref())
+        .map_err(|error| LineageWalkError::Malformed(format!("undecodable program: {error}")))
 }
 
 #[cfg(test)]
