@@ -119,11 +119,31 @@ A conforming walk MUST:
    singleton was melted. Every read failure surfaces as `LineageWalkError::Source(_)` carrying the
    source's OWN error unchanged, so *unsupported* stays distinguishable from *unreadable* and
    neither is ever collapsed into an absence.
+6. **Treat an unreadable spend as unknown, never as the tip.** `coin_spend` answers `Ok(None)` for
+   "unspent **or** unknown" (§3), so a walk MUST consult the coin's own `spent_height` before
+   concluding it has reached the tip. A coin recorded as SPENT whose spend the source does not serve
+   MUST fail closed with `LineageWalkError::Malformed`. Reporting it as the tip would present a
+   superseded state as current — and if the unserved spend was the melt, a dead singleton would
+   authenticate as live; at the launcher it would degrade an unknown into "never launched",
+   violating §3.
+7. **Refuse an unreadable `CREATE_COIN`.** Once a condition's opcode is known to be `CREATE_COIN`,
+   arguments the walk cannot decode (including an amount outside `i64`, or a negative amount that is
+   not the melt marker) MUST be a refusal. Skipping such a condition makes a spend look as though it
+   emitted no odd-amount child — a phantom melt, i.e. requirement 6's defect reached through the
+   condition decoder.
 
-**Stated limit.** An eve coin that has never been spent is admitted on the evidence of the launcher's
-own spend, which is the strongest evidence that exists: the eve is by definition the coin the
-launcher created. Its inner structure is constrained only once it is itself spent, at which point the
-curried launcher id is checked.
+`MAX_LINEAGE_DEPTH` is the ecosystem's SINGLE source of truth for this bound. A DIG crate that
+bounds a singleton lineage walk MUST import it from this crate rather than re-declare the literal;
+this crate is `00-foundation`, so every such consumer sits strictly above it.
+
+**Stated limit — the unspent eve.** An eve coin that has never been spent is admitted on the evidence
+of the launcher's own spend, which is the strongest evidence that exists: the eve is by definition the
+coin the launcher created, and the launcher's `CREATE_COIN` carries the eve's FULL puzzle hash, which
+is non-invertible — so nothing an attacker supplies reaches the decision. Consequently a launcher
+spent into an ORDINARY coin resolves to `Ok(Some(_))` with that coin as the tip, not `Ok(None)`. The
+eve's inner structure is constrained the moment it is itself spent, at which point the curried
+launcher id is checked and a non-singleton yields `NotASingleton`. A consumer that requires a *proven*
+singleton rather than a *launched* one MUST require a tip beyond the eve.
 
 ## 5. `CoinRecord` and `CoinState` conversion
 
