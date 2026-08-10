@@ -61,6 +61,18 @@ pub enum ChainSourceError {
         limit: usize,
     },
 
+    /// A puzzle reveal expanded to more than the walk's decompressed-size bound.
+    ///
+    /// Distinct from [`Malformed`](Self::Malformed) on purpose: the reveal may be perfectly
+    /// well-formed chain data — it is simply larger, once its CLVM back-references are expanded,
+    /// than this walk will authenticate. Blaming the source for corruption would be a lie, and
+    /// would hide the one thing a consumer can act on: the payload was too big, not wrong.
+    #[error("puzzle reveal expands beyond the {limit}-byte bound")]
+    RevealTooLarge {
+        /// The expanded-size bound the walk refused to exceed.
+        limit: usize,
+    },
+
     /// A singleton lineage walk exceeded its hop bound before reaching the tip.
     ///
     /// Distinct from every other variant, and deliberately NOT a silent truncation: the walk found

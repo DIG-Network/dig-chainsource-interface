@@ -36,7 +36,7 @@
 //!   the hop bound was exceeded). NEVER collapsed into "no lineage": a caller that reads a
 //!   transport failure as an absence is the class of bug that spends money twice.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -48,7 +48,7 @@ use chia_sdk_types::run_puzzle;
 use clvm_traits::FromClvm;
 use clvm_utils::{tree_hash_from_bytes, TreeHash};
 use clvmr::serde::node_from_bytes_backrefs;
-use clvmr::{Allocator, NodePtr};
+use clvmr::{Allocator, NodePtr, SExp};
 
 use crate::error::ChainSourceError;
 use crate::lineage::SingletonLineage;
@@ -159,6 +159,19 @@ pub enum LineageWalkError<E> {
         coin_id: Bytes32,
     },
 
+    /// A coin's puzzle reveal expands, once its CLVM back-references are unfolded, beyond
+    /// [`MAX_REVEAL_EXPANDED_BYTES`] — so the walk will not authenticate it.
+    ///
+    /// Deliberately NOT [`Malformed`](Self::Malformed): the reveal may be entirely well-formed and
+    /// may even hash to the coin's puzzle hash. It is refused for its SIZE, and a consumer that
+    /// cannot tell "too big" from "corrupt" cannot tell a hostile source from a heavy one.
+    RevealTooLarge {
+        /// The coin whose reveal was refused.
+        coin_id: Bytes32,
+        /// The expanded-size bound the walk refused to exceed.
+        limit: usize,
+    },
+
     /// The walk exceeded its hop bound. The lineage found so far is INCOMPLETE and is deliberately
     /// discarded rather than returned as a truncated member set.
     TooDeep {
@@ -184,6 +197,12 @@ impl<E: fmt::Display> fmt::Display for LineageWalkError<E> {
                 write!(
                     f,
                     "coin {coin_id} is not a genuine singleton of this launcher"
+                )
+            }
+            Self::RevealTooLarge { coin_id, limit } => {
+                write!(
+                    f,
+                    "the puzzle reveal of coin {coin_id} expands beyond the {limit}-byte bound"
                 )
             }
             Self::TooDeep { limit } => {
@@ -214,6 +233,12 @@ impl From<LineageWalkError<ChainSourceError>> for ChainSourceError {
             LineageWalkError::NotASingleton { coin_id } => ChainSourceError::Malformed(format!(
                 "coin {coin_id} is not a genuine singleton of this launcher"
             )),
+            // Size, not corruption — so it keeps its own variant rather than collapsing into
+            // `Malformed`, which would accuse an honest source of serving bad data for the crime of
+            // serving a big one.
+            LineageWalkError::RevealTooLarge { limit, .. } => {
+                ChainSourceError::RevealTooLarge { limit }
+            }
             LineageWalkError::TooDeep { limit } => ChainSourceError::LineageTooDeep { limit },
             // A budget overrun is exactly what `Timeout` means — "the read did not complete within
             // the deadline, so whether an answer exists is unknown". Mapping it to `Malformed` would
@@ -493,6 +518,10 @@ fn read_spend_of<S: ChainSource>(
             coin.coin_id()
         )));
     }
+    // BEFORE the reveal is hashed, parsed or run. Every later use of these bytes — the binding hash
+    // here, `Puzzle::parse`, the CLVM evaluator — is downstream of this guard, which is the only
+    // placement that bounds all three (see `require_expandable_reveal`).
+    require_expandable_reveal(coin.coin_id(), &spend.puzzle_reveal)?;
     let revealed = program_tree_hash(&spend.puzzle_reveal)?;
     if Bytes32::from(revealed) != coin.puzzle_hash {
         return Err(LineageWalkError::Malformed(format!(
@@ -715,20 +744,157 @@ fn alloc<E>(allocator: &mut Allocator, program: &Program) -> Result<NodePtr, Lin
         .map_err(|error| LineageWalkError::Malformed(format!("undecodable program: {error}")))
 }
 
+/// How many bytes a puzzle reveal may feed into SHA-256 once its CLVM back-references are
+/// **expanded**, before the walk refuses to authenticate it.
+///
+/// # Why an EXPANDED-size bound, and not a bound on the serialized reveal
+///
+/// CLVM back-references are a compression: a repeated subtree is written once and pointed at
+/// thereafter, so the bytes on the wire describe a shared DAG rather than a tree. Every consumer of
+/// that DAG — the reveal-binding hash, `Puzzle::parse`, the CLVM evaluator — sees the TREE the DAG
+/// unfolds into, and a `k`-level self-referential DAG unfolds into `2^k` nodes. The serialized size
+/// is therefore no evidence at all about the cost of using it: measured through this crate's public
+/// API, a **1,120-byte** reveal (a singleton curried around a 28-level self-cons) costs **75
+/// seconds**, and each additional 3 bytes on the wire DOUBLES that. A byte-length cap large enough
+/// for an honest singleton is orders of magnitude larger than the bomb, so it bounds nothing.
+///
+/// This bound is measured on the expansion instead, which is exactly the quantity the work is
+/// proportional to (see [`expanded_hash_input_bytes`]). Amplification is then capped at 1 by
+/// construction: no serialized size, at any depth, can buy more work than this.
+///
+/// # Why this value
+///
+/// Measured expansion of real reveals, curried from the canonical chia puzzles:
+///
+/// | reveal | serialized | expanded |
+/// |---|---|---|
+/// | `p2_delegated_puzzle_or_hidden_puzzle` alone | 291 B | 8.1 KB |
+/// | `singleton(p2)` — the plainest singleton there is | 1.4 KB | 41.2 KB |
+/// | `singleton(did_innerpuz(p2))`, empty metadata | 2.5 KB | 75.0 KB |
+/// | `singleton(nft state + ownership + royalty)`, 8 long URIs | 6.3 KB | 136.5 KB |
+/// | `singleton(did_innerpuz(p2))` carrying 8 KB of curried metadata | 34.5 KB | 632.7 KB |
+///
+/// 4 MiB is **30x** the heaviest realistic reveal there (the extravagant NFT) and **6.6x** the
+/// deliberately absurd 8 KB-metadata DID, so the bound has room for singletons far heavier than
+/// anything the ecosystem builds — the failure it must never produce is refusing an honest
+/// singleton on a money path. At the same time it caps a hop's hashing at roughly two milliseconds,
+/// which leaves [`DEFAULT_WALK_BUDGET`] the effective outer bound on the walk as a whole rather than
+/// something reveal size can steer past.
+///
+/// It is a hostile-input guard, not a policy limit: a reveal beyond it is refused as
+/// [`LineageWalkError::RevealTooLarge`], which says "too big to authenticate", never "malformed".
+pub const MAX_REVEAL_EXPANDED_BYTES: usize = 4 * 1024 * 1024;
+
+/// The number of bytes `clvm_utils::tree_hash` would feed into SHA-256 for the tree `root` expands
+/// into, saturating at `limit + 1` so a bomb is detected rather than computed.
+///
+/// This is the CLVM tree-hash cost model, stated exactly: an atom contributes its `0x01` prefix
+/// plus its own bytes, and a pair contributes its `0x02` prefix plus its two 32-byte child hashes.
+/// Bounding it therefore bounds every downstream tree-hash of the same reveal — including the
+/// NON-memoizing `clvm_utils::tree_hash` that `chia_sdk_driver::Puzzle::parse` performs, which no
+/// cache protects and which is the site the 1,120-byte bomb above detonates.
+///
+/// Runs in time linear in the DAG (each distinct node is costed once, memoized by [`NodePtr`]), and
+/// iteratively rather than recursively, because the DAG may be tens of thousands of levels deep.
+fn expanded_hash_input_bytes(allocator: &Allocator, root: NodePtr, limit: usize) -> usize {
+    /// One `0x01` prefix byte precedes an atom's own bytes.
+    const ATOM_PREFIX: usize = 1;
+    /// One `0x02` prefix byte precedes a pair's two 32-byte child hashes.
+    const PAIR_COST: usize = 1 + 32 + 32;
+
+    // One byte past the limit is enough to refuse, and clamping every partial sum here is what
+    // keeps the doubling from ever being computed — or from overflowing `usize`.
+    let ceiling = limit.saturating_add(1);
+
+    enum Step {
+        /// Cost this node, descending into it if it is an unseen pair.
+        Cost(NodePtr),
+        /// Both children of this pair are costed and on `costed`; combine them.
+        Combine(NodePtr),
+    }
+
+    let mut sizes: HashMap<NodePtr, usize> = HashMap::new();
+    let mut steps = vec![Step::Cost(root)];
+    let mut costed: Vec<usize> = Vec::new();
+
+    while let Some(step) = steps.pop() {
+        match step {
+            Step::Cost(node) => {
+                if let Some(&known) = sizes.get(&node) {
+                    costed.push(known);
+                    continue;
+                }
+                match allocator.sexp(node) {
+                    SExp::Atom => {
+                        let size = ATOM_PREFIX
+                            .saturating_add(allocator.atom_len(node))
+                            .min(ceiling);
+                        sizes.insert(node, size);
+                        costed.push(size);
+                    }
+                    SExp::Pair(left, right) => {
+                        steps.push(Step::Combine(node));
+                        steps.push(Step::Cost(right));
+                        steps.push(Step::Cost(left));
+                    }
+                }
+            }
+            Step::Combine(node) => {
+                let (right, left) = (
+                    costed.pop().expect("a pair's right child was costed first"),
+                    costed.pop().expect("a pair's left child was costed first"),
+                );
+                let size = PAIR_COST
+                    .saturating_add(left)
+                    .saturating_add(right)
+                    .min(ceiling);
+                sizes.insert(node, size);
+                costed.push(size);
+            }
+        }
+    }
+
+    costed
+        .pop()
+        .expect("the traversal leaves the root's cost on the stack")
+}
+
+/// Refuses a puzzle reveal whose expansion exceeds [`MAX_REVEAL_EXPANDED_BYTES`], BEFORE anything
+/// hashes, parses or runs it.
+///
+/// # Why this runs first, and on its own allocator
+///
+/// The reveal-binding check is the first thing a hop does with attacker-supplied bytes, so every
+/// later use of the reveal is downstream of it. Placing the bound here means the guard covers not
+/// just the binding hash but `parse_spend`, `Puzzle::parse` and the CLVM evaluator too — a bound
+/// applied at the binding hash alone would leave the non-memoizing hash inside `Puzzle::parse`
+/// reachable one hop deeper, which is exactly how the 1,120-byte bomb defeats a size cap placed
+/// there. The scratch allocator is dropped on return, so measuring costs no arena the hop keeps.
+///
+/// Deserialization failure is reported as [`LineageWalkError::Malformed`] with the same wording
+/// [`alloc`] uses, because it is the same fact about the same bytes.
+fn require_expandable_reveal<E>(
+    coin_id: Bytes32,
+    reveal: &Program,
+) -> Result<(), LineageWalkError<E>> {
+    let allocator = &mut Allocator::new();
+    let node = alloc(allocator, reveal)?;
+    if expanded_hash_input_bytes(allocator, node, MAX_REVEAL_EXPANDED_BYTES)
+        > MAX_REVEAL_EXPANDED_BYTES
+    {
+        return Err(LineageWalkError::RevealTooLarge {
+            coin_id,
+            limit: MAX_REVEAL_EXPANDED_BYTES,
+        });
+    }
+    Ok(())
+}
+
 /// The CLVM tree hash of a serialized [`Program`], without disturbing the walk's allocator.
 ///
-/// # Why the MEMOIZING hasher, and not `clvm_utils::tree_hash`
-///
-/// Back-references (see [`alloc`]) decode to a shared DAG, not a tree: a repeated subtree becomes
-/// one node with many parents. `tree_hash` is a plain stack traversal with no cache, so it re-hashes
-/// every shared node once per path that reaches it — `2^k` hash operations for a `k`-level
-/// self-referential DAG. That makes a ~74-byte puzzle reveal a decompression bomb, and this call
-/// site is the FIRST thing a hop does with attacker-supplied bytes: the reveal must be hashed before
-/// it can be compared to the coin's puzzle hash, so the binding check is what detonates. The
-/// walk's wall-clock budget cannot help, because it is checked between hops rather than inside one.
-///
-/// [`tree_hash_from_bytes`] is back-reference-aware AND memoizing (it hashes each shared node once),
-/// which is why `chia-peer` already uses it for the same job.
+/// Memoizing and back-reference-aware, so each shared node is hashed once. That is a performance
+/// property, NOT the walk's defense against a decompression bomb — see
+/// [`require_expandable_reveal`], which is what makes this call safe to reach.
 fn program_tree_hash<E>(program: &Program) -> Result<TreeHash, LineageWalkError<E>> {
     tree_hash_from_bytes(program.as_ref())
         .map_err(|error| LineageWalkError::Malformed(format!("undecodable program: {error}")))

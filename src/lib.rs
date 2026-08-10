@@ -73,7 +73,7 @@ pub use source::{ChainSource, ChainSourceProvider};
 pub use walk::{
     resolve_singleton_lineage_via_walk, walk_singleton_lineage, walk_singleton_lineage_bounded,
     walk_singleton_lineage_within, LineageWalkError, WalkBounds, DEFAULT_WALK_BUDGET,
-    MAX_LINEAGE_DEPTH,
+    MAX_LINEAGE_DEPTH, MAX_REVEAL_EXPANDED_BYTES,
 };
 
 #[cfg(feature = "testing")]

@@ -22,12 +22,12 @@ use chia_protocol::{Bytes32, Coin, CoinSpend, Program};
 use chia_puzzle_types::singleton::{SingletonArgs, SingletonSolution};
 use chia_puzzle_types::{EveProof, Proof};
 use chia_sdk_driver::SpendContext;
-use clvm_utils::tree_hash;
-use clvmr::serde::{node_from_bytes, node_to_bytes_backrefs};
+use clvm_utils::{tree_hash, tree_hash_from_bytes};
+use clvmr::serde::{node_from_bytes, node_from_bytes_backrefs, node_to_bytes_backrefs};
 use clvmr::{Allocator, NodePtr};
 use dig_chainsource_interface::{
     walk_singleton_lineage_within, ChainSource, ChainSourceError, CoinRecord, LineageWalkError,
-    SingletonLineage, WalkBounds,
+    SingletonLineage, WalkBounds, MAX_REVEAL_EXPANDED_BYTES,
 };
 
 /// The `c` (cons) CLVM operator.
@@ -461,13 +461,14 @@ impl ChainSource for BombSource {
     }
 }
 
-/// A ~74-byte puzzle reveal must not cost minutes of CPU — the reveal hash must be MEMOIZED.
+/// A 91-byte puzzle reveal must not cost minutes of CPU, and must be refused for its SIZE.
 ///
-/// # Why this asserts on the clock and not only on the outcome
+/// # Why this asserts on the clock as well as the outcome
 ///
-/// The bomb's hash cannot possibly equal the launcher's puzzle hash, so the walk refuses it either
-/// way: the outcome is `Malformed` whether the hash took 151 µs or 140 seconds. Only elapsed time
-/// distinguishes a memoizing hash from a non-memoizing one, so elapsed time is what is asserted.
+/// The bomb's hash cannot equal the launcher's puzzle hash, so a walk with no size bound at all
+/// still refuses it — as `Malformed`, after however long the hash took. Elapsed time is what
+/// separates a walk that bounded the expansion from one that computed it, so elapsed time is
+/// asserted alongside the variant.
 ///
 /// # Why the wall-clock BUDGET does not cover this
 ///
@@ -475,12 +476,16 @@ impl ChainSource for BombSource {
 /// time has passed, so the check passes and the hop then runs unbounded — the budget bounds the
 /// NUMBER of hops, never the cost of one.
 ///
-/// Measured on this fixture at depth 24 (74 serialized bytes), debug: **140.4 s** with the
-/// non-memoizing `clvm_utils::tree_hash`, **151 µs** with `tree_hash_from_bytes`. The threshold below
-/// sits three orders of magnitude beneath the unfixed cost, so it cannot be met by a slow machine.
+/// # The margin, measured rather than asserted
+///
+/// Measured on this fixture against a non-memoizing hash, RELEASE profile: depth 24 → 1.91 s,
+/// 26 → 7.51 s, 28 → 30.07 s, so this fixture's depth 30 costs about **120 s**. The 5-second
+/// threshold therefore sits ~24x beneath the unfixed cost in the profile CI is least likely to
+/// use — the depth matters, because at depth 24 the unfixed walk finishes in 1.91 s and this test
+/// would pass with the defect present.
 #[test]
-fn a_backref_decompression_bomb_in_a_puzzle_reveal_is_hashed_in_bounded_time() -> Result<()> {
-    let source = BombSource::at_depth(24);
+fn a_backref_decompression_bomb_in_a_puzzle_reveal_is_refused_in_bounded_time() -> Result<()> {
+    let source = BombSource::at_depth(30);
 
     let started = Instant::now();
     let error = walk_singleton_lineage_within(
@@ -490,18 +495,186 @@ fn a_backref_decompression_bomb_in_a_puzzle_reveal_is_hashed_in_bounded_time() -
         // this test pass — if the hash were unbounded the walk would still be inside its first hop.
         WalkBounds::hops(4).within(Duration::from_secs(600)),
     )
-    .expect_err("a reveal that does not hash to the coin's puzzle hash is refused");
+    .expect_err("a reveal that expands beyond the bound is refused");
     let elapsed = started.elapsed();
 
-    assert!(
-        matches!(error, LineageWalkError::Malformed(ref message) if message.contains("puzzle reveal")),
-        "the bomb is refused as a reveal that does not match the coin, not by any other guard: \
-         {error:?}"
+    assert_eq!(
+        error,
+        LineageWalkError::RevealTooLarge {
+            coin_id: source.launcher.coin_id(),
+            limit: MAX_REVEAL_EXPANDED_BYTES,
+        },
+        "the bomb is refused for its EXPANSION, not as malformed chain data: {error:?}"
     );
     assert!(
         elapsed < Duration::from_secs(5),
-        "hashing a {}-byte reveal must be memoized; it took {elapsed:?}",
+        "a {}-byte reveal must be bounded before it is hashed; it took {elapsed:?}",
         source.bomb.as_ref().len()
+    );
+    Ok(())
+}
+
+/// A source whose launcher hop is entirely honest and whose EVE reveal hides the bomb one layer in.
+///
+/// # Why a second bomb fixture, when [`BombSource`] already exists
+///
+/// [`BombSource`] detonates at the reveal-binding hash, which is memoizing. Curry the same bomb as
+/// the INNER puzzle of an otherwise genuine singleton and the binding hash sails through — the
+/// reveal really does hash to the eve's puzzle hash, because the walk DERIVED that puzzle hash from
+/// the bomb's own tree hash — and the spend then reaches `chia_sdk_driver::Puzzle::parse`, which
+/// calls the NON-memoizing `clvm_utils::tree_hash`. No cache protects that call at any depth.
+///
+/// Measured through the public API against a walk whose only defense was memoization, RELEASE
+/// profile: reveal 1,084 B → 17 ms at depth 16, 1,108 B → 4.64 s at 24, 1,120 B → **75 s** at 28.
+/// Roughly three bytes on the wire per doubling, unbounded. A cap on the reveal's SERIALIZED length
+/// cannot see this attack at all: every one of those reveals is about a kilobyte.
+///
+/// Reaching the second hop costs the attacker nothing, because the same lying source answers the
+/// `coin_record` that binds the eve to "real" chain state.
+struct EveInnerBombSource {
+    launcher: Coin,
+    launcher_solution: Program,
+    eve: Coin,
+    eve_reveal: Program,
+    records: HashMap<Bytes32, CoinRecord>,
+}
+
+impl EveInnerBombSource {
+    fn at_depth(depth: u32) -> Result<Self> {
+        let ctx = &mut SpendContext::new();
+        let launcher = Coin::new(
+            Bytes32::new([0xC0; 32]),
+            Bytes32::new(chia_puzzles::SINGLETON_LAUNCHER_HASH),
+            1,
+        );
+        let launcher_id = launcher.coin_id();
+
+        // The eve's puzzle hash is the one the WALK will derive, so it is computed the way the walk
+        // computes it: from the launcher id and the bomb's own (cheaply memoized) tree hash.
+        let bomb = backref_bomb(depth);
+        let inner_hash = tree_hash_from_bytes(bomb.as_ref()).expect("the bomb decodes");
+        let inner = node_from_bytes_backrefs(ctx, bomb.as_ref())?;
+        let outer = ctx.curry(SingletonArgs::new(launcher_id, inner))?;
+        let eve_reveal = Program::from(node_to_bytes_backrefs(ctx, outer)?);
+        let eve_puzzle_hash =
+            Bytes32::from(SingletonArgs::curry_tree_hash(launcher_id, inner_hash));
+        let eve = Coin::new(launcher_id, eve_puzzle_hash, 1);
+
+        let solution = ctx.alloc(&(eve_puzzle_hash, (1u64, (Vec::<Bytes32>::new(), ()))))?;
+        let spent_at = |coin: Coin, height: u32| CoinRecord {
+            coin,
+            confirmed_height: Some(1),
+            spent_height: Some(height),
+            timestamp: None,
+            coinbase: false,
+        };
+        Ok(Self {
+            launcher,
+            launcher_solution: ctx.serialize(&solution)?,
+            eve,
+            eve_reveal,
+            records: HashMap::from([
+                (launcher_id, spent_at(launcher, 2)),
+                (eve.coin_id(), spent_at(eve, 3)),
+            ]),
+        })
+    }
+}
+
+impl ChainSource for EveInnerBombSource {
+    type Error = ChainSourceError;
+
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        Ok(self.records.get(&coin_id).cloned())
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        _puzzle_hash: Bytes32,
+        _include_spent: bool,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    fn coin_records_by_parent(
+        &self,
+        _parent_coin_id: Bytes32,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        if coin_id == self.launcher.coin_id() {
+            return Ok(Some(CoinSpend::new(
+                self.launcher,
+                Program::from(chia_puzzles::SINGLETON_LAUNCHER.to_vec()),
+                self.launcher_solution.clone(),
+            )));
+        }
+        if coin_id == self.eve.coin_id() {
+            return Ok(Some(CoinSpend::new(
+                self.eve,
+                self.eve_reveal.clone(),
+                // Never reached: the eve's reveal is refused for its expansion first.
+                Program::from(vec![0x80]),
+            )));
+        }
+        Ok(None)
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        launcher_id: Bytes32,
+    ) -> Result<Option<SingletonLineage>, Self::Error> {
+        dig_chainsource_interface::resolve_singleton_lineage_via_walk(self, launcher_id)
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        Ok(None)
+    }
+
+    fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
+        Ok(None)
+    }
+}
+
+/// A bomb that PASSES the reveal-binding hash must still be refused, before anything parses it.
+///
+/// This is the test that pins the bound's PLACEMENT. A size guard sitting at the binding hash would
+/// satisfy [`a_backref_decompression_bomb_in_a_puzzle_reveal_is_refused_in_bounded_time`] and leave
+/// this one detonating, because the eve's reveal is a genuine singleton whose hash genuinely matches
+/// its coin — the guard has to sit ahead of every use of the bytes, not ahead of one of them.
+///
+/// Against a walk defended only by memoization this fixture costs about **300 s** at depth 30
+/// (75 s measured at depth 28, doubling per level), so the 5-second threshold has a ~60x margin in
+/// the RELEASE profile.
+#[test]
+fn a_bomb_curried_inside_a_genuine_singleton_reveal_is_refused_before_it_is_parsed() -> Result<()> {
+    let source = EveInnerBombSource::at_depth(30)?;
+
+    let started = Instant::now();
+    let error = walk_singleton_lineage_within(
+        &source,
+        source.launcher.coin_id(),
+        WalkBounds::hops(4).within(Duration::from_secs(600)),
+    )
+    .expect_err("a reveal that expands beyond the bound is refused");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        error,
+        LineageWalkError::RevealTooLarge {
+            // The EVE's reveal, not the launcher's: the launcher hop is honest and must be walked
+            // successfully for this fixture to be testing what it claims to test.
+            coin_id: source.eve.coin_id(),
+            limit: MAX_REVEAL_EXPANDED_BYTES,
+        },
+        "the inner bomb is refused for its EXPANSION, at the eve hop: {error:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a {}-byte reveal must be bounded before it is parsed; it took {elapsed:?}",
+        source.eve_reveal.as_ref().len()
     );
     Ok(())
 }
