@@ -72,7 +72,8 @@ pub use source::{ChainSource, ChainSourceProvider};
 #[cfg(feature = "lineage-walk")]
 pub use walk::{
     resolve_singleton_lineage_via_walk, walk_singleton_lineage, walk_singleton_lineage_bounded,
-    LineageWalkError, MAX_LINEAGE_DEPTH,
+    walk_singleton_lineage_within, LineageWalkError, WalkBounds, DEFAULT_WALK_BUDGET,
+    MAX_LINEAGE_DEPTH,
 };
 
 #[cfg(feature = "testing")]

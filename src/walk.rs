@@ -38,6 +38,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use chia_protocol::{Bytes32, Coin, CoinSpend, Program};
 use chia_puzzle_types::singleton::SingletonArgs;
@@ -75,6 +76,64 @@ use crate::source::ChainSource;
 /// `dig_evidence::MAX_LINEAGE_DEPTH`.
 pub const MAX_LINEAGE_DEPTH: usize = 100_000;
 
+/// The wall-clock budget an entire [`walk_singleton_lineage`] may consume.
+///
+/// # Why a hop cap is not enough
+///
+/// [`MAX_LINEAGE_DEPTH`] bounds how many spends the walk follows; it bounds neither the total time
+/// nor the per-hop CLVM cost of following them. A hostile source that answers every hop with a
+/// structurally valid, ever-advancing chain of DISTINCT recreations trips no guard — the cycle guard
+/// sees no repeat and every hop authenticates — so it holds the walk for as long as it keeps
+/// serving. [`ChainSource`] is SYNCHRONOUS, so that is the caller's thread: at the default hop bound
+/// and 20 ms per read, an attacker buys the better part of an hour of hang, inside whatever ceremony
+/// the caller was performing.
+///
+/// This budget is therefore the PRIMARY denial-of-service defense and the hop cap is the
+/// belt-and-braces bound beneath it. It is generous enough for any legitimate lineage over a healthy
+/// source and matches the equivalent bound in `chia-query`'s walk, so the two agree about how long a
+/// lineage resolution may take.
+pub const DEFAULT_WALK_BUDGET: Duration = Duration::from_secs(45);
+
+/// How far, and for how long, a lineage walk may run before failing closed.
+///
+/// Both bounds are always present: [`WalkBounds::default`] is what [`walk_singleton_lineage`] uses,
+/// so a provider whose `resolve_singleton_lineage` is a one-line delegation INHERITS the
+/// denial-of-service guards rather than having to remember them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkBounds {
+    /// The maximum number of spends to follow ([`LineageWalkError::TooDeep`] beyond it).
+    pub max_hops: usize,
+    /// The wall-clock budget for the whole walk ([`LineageWalkError::DeadlineExceeded`] beyond it).
+    pub budget: Duration,
+}
+
+impl Default for WalkBounds {
+    fn default() -> Self {
+        Self {
+            max_hops: MAX_LINEAGE_DEPTH,
+            budget: DEFAULT_WALK_BUDGET,
+        }
+    }
+}
+
+impl WalkBounds {
+    /// The default bounds with a chosen hop cap — the form tests use to exercise
+    /// [`LineageWalkError::TooDeep`] over a short chain.
+    #[must_use]
+    pub fn hops(max_hops: usize) -> Self {
+        Self {
+            max_hops,
+            ..Self::default()
+        }
+    }
+
+    /// These bounds with a chosen wall-clock budget.
+    #[must_use]
+    pub fn within(self, budget: Duration) -> Self {
+        Self { budget, ..self }
+    }
+}
+
 /// Why a singleton lineage walk could not answer.
 ///
 /// Every variant means **the walk does not know** — none of them means "there is no lineage", which
@@ -106,6 +165,14 @@ pub enum LineageWalkError<E> {
         /// The hop bound the walk refused to exceed.
         limit: usize,
     },
+
+    /// The walk outlasted its wall-clock budget. Like [`TooDeep`](Self::TooDeep) the partial lineage
+    /// is discarded; unlike it, nothing about the chain was necessarily wrong — the walk simply ran
+    /// out of time, which is why it reports as a timeout rather than as inconsistent chain data.
+    DeadlineExceeded {
+        /// The budget the walk refused to exceed.
+        budget: Duration,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for LineageWalkError<E> {
@@ -121,6 +188,12 @@ impl<E: fmt::Display> fmt::Display for LineageWalkError<E> {
             }
             Self::TooDeep { limit } => {
                 write!(f, "singleton lineage walk exceeded its {limit}-hop bound")
+            }
+            Self::DeadlineExceeded { budget } => {
+                write!(
+                    f,
+                    "singleton lineage walk exceeded its {budget:?} wall-clock budget"
+                )
             }
         }
     }
@@ -142,6 +215,10 @@ impl From<LineageWalkError<ChainSourceError>> for ChainSourceError {
                 "coin {coin_id} is not a genuine singleton of this launcher"
             )),
             LineageWalkError::TooDeep { limit } => ChainSourceError::LineageTooDeep { limit },
+            // A budget overrun is exactly what `Timeout` means — "the read did not complete within
+            // the deadline, so whether an answer exists is unknown". Mapping it to `Malformed` would
+            // accuse an honest source of serving bad data for the crime of being slow.
+            LineageWalkError::DeadlineExceeded { .. } => ChainSourceError::Timeout,
         }
     }
 }
@@ -178,8 +255,8 @@ where
 /// is the only sound construction). It never echoes a caller-supplied coin, and the caller supplies
 /// nothing but the launcher id.
 ///
-/// Bounded at [`MAX_LINEAGE_DEPTH`] hops; use [`walk_singleton_lineage_bounded`] to choose another
-/// bound.
+/// Bounded by [`WalkBounds::default`] — [`MAX_LINEAGE_DEPTH`] hops within [`DEFAULT_WALK_BUDGET`];
+/// use [`walk_singleton_lineage_within`] to choose other bounds.
 ///
 /// # Returns
 ///
@@ -195,6 +272,7 @@ where
 /// | the chain data is inconsistent, incl. a spent coin whose spend the source cannot serve | `Err(LineageWalkError::Malformed(_))` |
 /// | a coin is not a genuine singleton of this launcher | `Err(LineageWalkError::NotASingleton { .. })` |
 /// | the hop bound was exceeded | `Err(LineageWalkError::TooDeep { .. })` |
+/// | the wall-clock budget was exceeded | `Err(LineageWalkError::DeadlineExceeded { .. })` |
 ///
 /// # The unspent eve (SPEC §4a)
 ///
@@ -212,48 +290,60 @@ pub fn walk_singleton_lineage<S: ChainSource>(
     source: &S,
     launcher_id: Bytes32,
 ) -> Result<Option<SingletonLineage>, LineageWalkError<S::Error>> {
-    walk_singleton_lineage_bounded(source, launcher_id, MAX_LINEAGE_DEPTH)
+    walk_singleton_lineage_within(source, launcher_id, WalkBounds::default())
 }
 
-/// [`walk_singleton_lineage`] with an explicit hop bound.
+/// [`walk_singleton_lineage`] with an explicit hop bound, at the default wall-clock budget.
 ///
-/// Factored out so the [`LineageWalkError::TooDeep`] behaviour can be exercised over a short real
-/// chain with a tiny bound, rather than only by a 100,000-hop fixture that no test would build.
+/// Retained as the narrow, hop-only form; [`walk_singleton_lineage_within`] takes both bounds.
 pub fn walk_singleton_lineage_bounded<S: ChainSource>(
     source: &S,
     launcher_id: Bytes32,
     max_hops: usize,
 ) -> Result<Option<SingletonLineage>, LineageWalkError<S::Error>> {
+    walk_singleton_lineage_within(source, launcher_id, WalkBounds::hops(max_hops))
+}
+
+/// [`walk_singleton_lineage`] with explicit [`WalkBounds`].
+///
+/// Both bounds are exposed so each can be exercised over a short real chain with a tiny value,
+/// rather than only by a fixture no test would build.
+pub fn walk_singleton_lineage_within<S: ChainSource>(
+    source: &S,
+    launcher_id: Bytes32,
+    bounds: WalkBounds,
+) -> Result<Option<SingletonLineage>, LineageWalkError<S::Error>> {
+    let started = Instant::now();
     let Some(launcher) = read_launcher_coin(source, launcher_id)? else {
         return Ok(None);
     };
 
-    let mut allocator = Allocator::new();
     let mut members = BTreeSet::from([launcher_id]);
     let mut current = launcher.coin;
     // Carried alongside `current` because `coin_spend` answers `Ok(None)` for "unspent OR unknown";
     // only the coin's OWN record tells those apart (see [`read_spend_of`]).
     let mut current_spent_height = launcher.spent_height;
     // The launcher's own spend is structurally different from a singleton spend (its CREATE_COIN
-    // already carries the eve's FULL puzzle hash), so the first hop is handled separately.
-    let mut at_launcher = true;
+    // already carries the eve's FULL puzzle hash), so the first hop obeys a different rule.
+    let mut rule = HopRule::Launch;
 
     // `max_hops` counts SPENDS followed, so the loop runs one extra time: the final read is the one
     // that discovers the tip is unspent, and it follows no spend.
-    for _hop in 0..=max_hops {
+    for _hop in 0..=bounds.max_hops {
+        if started.elapsed() > bounds.budget {
+            return Err(LineageWalkError::DeadlineExceeded {
+                budget: bounds.budget,
+            });
+        }
+
         let Some(spend) = read_spend_of(source, current, current_spent_height)? else {
             // An unspent coin is the tip — unless it is the launcher itself, in which case no
             // singleton state was ever minted.
+            let at_launcher = matches!(rule, HopRule::Launch);
             return Ok((!at_launcher).then(|| SingletonLineage::new(current.coin_id(), members)));
         };
 
-        let (puzzle, solution) = parse_spend(&mut allocator, &spend)?;
-        let successor = if at_launcher {
-            eve_created_by_launcher(&mut allocator, current, puzzle, solution)?
-        } else {
-            singleton_successor(&mut allocator, current, launcher_id, puzzle, solution)?
-        };
-        let Some(successor) = successor else {
+        let Some(successor) = successor_of(current, &spend, rule)? else {
             // The spend emitted no odd-amount successor: the singleton was melted, so it has no
             // current coin. A melt is a genuine absence, not a failure.
             return Ok(None);
@@ -267,10 +357,52 @@ pub fn walk_singleton_lineage_bounded<S: ChainSource>(
         admit_member(&mut members, successor.coin_id())?;
         current = successor;
         current_spent_height = record.spent_height;
-        at_launcher = false;
+        rule = HopRule::Recreate { launcher_id };
     }
 
-    Err(LineageWalkError::TooDeep { limit: max_hops })
+    Err(LineageWalkError::TooDeep {
+        limit: bounds.max_hops,
+    })
+}
+
+/// Which rule authenticates the hop about to be followed.
+#[derive(Debug, Clone, Copy)]
+enum HopRule {
+    /// The LAUNCHER's own spend: its `CREATE_COIN` already carries the eve's FULL puzzle hash, and
+    /// no reveal has yet been parsed as a singleton.
+    Launch,
+    /// A singleton spend: the reveal must parse as a singleton layer curried to this launcher, and
+    /// the successor's puzzle hash is recomputed from it.
+    Recreate { launcher_id: Bytes32 },
+}
+
+/// Derives the successor `spend` creates for `coin`, or `None` when the spend ends the lineage.
+///
+/// # Why the allocator is created HERE, once per hop
+///
+/// A [`clvmr::Allocator`] is an arena: it allocates monotonically and frees nothing until it is
+/// dropped. An allocator hoisted outside the walk's loop therefore accumulates every hop's puzzle,
+/// solution and evaluation for the whole walk, so a hostile source's ever-advancing chain buys
+/// unbounded memory alongside unbounded time — measured at 552 MB over 100,000 hops, against 24 MB
+/// when each hop starts clean. Worse, the arena's own node ceiling is reached before
+/// [`MAX_LINEAGE_DEPTH`] is, so the walk fails as [`LineageWalkError::Malformed`] — accusing an
+/// honest source of serving inconsistent chain data when the truth is that the walk ran out of room.
+///
+/// Owning the allocator inside this function is what makes that unhoistable: nothing above it holds
+/// one, so the per-hop reset cannot be quietly undone by moving a line.
+fn successor_of<E>(
+    coin: Coin,
+    spend: &CoinSpend,
+    rule: HopRule,
+) -> Result<Option<Coin>, LineageWalkError<E>> {
+    let allocator = &mut Allocator::new();
+    let (puzzle, solution) = parse_spend(allocator, spend)?;
+    match rule {
+        HopRule::Launch => eve_created_by_launcher(allocator, coin, puzzle, solution),
+        HopRule::Recreate { launcher_id } => {
+            singleton_successor(allocator, coin, launcher_id, puzzle, solution)
+        }
+    }
 }
 
 /// Records `coin_id` as a lineage member, refusing a repeat.
