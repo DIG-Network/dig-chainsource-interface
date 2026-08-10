@@ -68,8 +68,11 @@ fn resolve_singleton_lineage(
 
 The walk starts at the launcher coin and **derives** each successive coin by running the previous
 coin's own spend — it never recognises a coin by its puzzle hash, its curried launcher id, or its
-presence in a child list, because all three are attacker-chosen. It is bounded at
-`MAX_LINEAGE_DEPTH` spends and refuses rather than truncating. See SPEC.md §4a.
+presence in a child list, because all three are attacker-chosen. It refuses rather than truncating
+past either of its two bounds — `MAX_LINEAGE_DEPTH` spends and `DEFAULT_WALK_BUDGET` of wall-clock
+time — so a hostile source serving an endless chain of valid recreations can neither hang the
+calling thread nor grow the walk's memory without limit. Both bounds come with the one-line
+delegation above; `walk_singleton_lineage_within` chooses others. See SPEC.md §4a.
 
 The feature is off by default: the walk needs a CLVM evaluator, and a consumer that only depends on
 the trait should not pay for one.

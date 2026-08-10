@@ -56,6 +56,7 @@ Every fallible method distinguishes:
 - `TooManyRecords { count, limit }` — the backend returned more records than the consumer's
   hostile-input bound allows; distinct from `Malformed` (each record may be well-formed, but the
   count exceeds the cap) — the consumer fails closed the same as every other variant.
+- `Timeout` — also carries a lineage walk that exceeded its wall-clock budget (§4a).
 - `LineageTooDeep { limit }` — a singleton lineage walk exceeded its hop bound (§4a). The lineage it
   could build is INCOMPLETE, so it is refused rather than truncated: a partial member set would make
   `contains` answer `false` for genuine members, which is a fail-OPEN membership answer.
@@ -83,13 +84,22 @@ reads would have to hand-roll the §4 money-critical requirement. The optional, 
 
 ```rust
 pub const MAX_LINEAGE_DEPTH: usize = 100_000;
+pub const DEFAULT_WALK_BUDGET: Duration = Duration::from_secs(45);
 
-pub enum LineageWalkError<E> { Source(E), Malformed(String), NotASingleton { coin_id }, TooDeep { limit } }
+pub struct WalkBounds { pub max_hops: usize, pub budget: Duration }  // Default: the two constants above
+
+pub enum LineageWalkError<E> {
+    Source(E), Malformed(String), NotASingleton { coin_id },
+    TooDeep { limit }, DeadlineExceeded { budget },
+}
 
 pub fn walk_singleton_lineage<S: ChainSource>(source: &S, launcher_id: Bytes32)
     -> Result<Option<SingletonLineage>, LineageWalkError<S::Error>>;
 
 pub fn walk_singleton_lineage_bounded<S: ChainSource>(source: &S, launcher_id: Bytes32, max_hops: usize)
+    -> Result<Option<SingletonLineage>, LineageWalkError<S::Error>>;
+
+pub fn walk_singleton_lineage_within<S: ChainSource>(source: &S, launcher_id: Bytes32, bounds: WalkBounds)
     -> Result<Option<SingletonLineage>, LineageWalkError<S::Error>>;
 
 pub fn resolve_singleton_lineage_via_walk<S: ChainSource<Error = ChainSourceError>>(
@@ -108,28 +118,48 @@ A conforming walk MUST:
 2. **Bind each derived coin to chain state.** A CLVM solution is not committed to by a coin's puzzle
    hash, so a dishonest source could pair a genuine reveal with a fabricated solution. Each derived
    successor MUST be confirmed to exist via `coin_record` before it enters the lineage.
-3. **Decode the `CREATE_COIN` amount as SIGNED.** CLVM atoms carry no sign, so the singleton melt
-   marker `-113` decodes into a `u64` as `143` — an odd, positive amount indistinguishable from an
-   ordinary recreation. A walk that made that mistake would invent a phantom successor for every
-   melted singleton instead of reporting the melt.
-4. **Refuse, never truncate, past its bound** (`MAX_LINEAGE_DEPTH` spends by default) and reject a
-   repeated coin id as a cycle.
-5. **Preserve the three-valued discipline of §3.** `Ok(None)` means the launcher id names no coin,
+3. **Decode the `CREATE_COIN` amount as SIGNED, and decode it BEFORE the puzzle hash.** CLVM atoms
+   carry no sign, so the singleton melt marker `-113` decodes into a `u64` as `143` — an odd,
+   positive amount indistinguishable from an ordinary recreation. A walk that made that mistake
+   would invent a phantom successor for every melted singleton instead of reporting the melt. The
+   amount is also the DISCRIMINANT for the puzzle hash: the canonical melt condition is
+   `(51 () -113)`, carrying a NIL puzzle hash, which is what standard chia-wallet-sdk tooling emits.
+   A walk that required a 32-byte puzzle hash before testing the melt marker would refuse every such
+   melt, making a singleton melted with standard tooling permanently unanswerable. Both the nil and
+   the 32-byte melt forms MUST decode as a melt.
+4. **Deserialize programs with the BACK-REFERENCE reader.** A puzzle reveal or solution may be
+   serialized in the CLVM back-reference form — the compressed encoding full nodes accept and block
+   generators emit, which a curried singleton reveal exercises heavily. A walk that reads only the
+   non-backref form reports a genuine singleton as `Malformed`, blaming an honest source.
+5. **Refuse, never truncate, past EITHER bound** — `MAX_LINEAGE_DEPTH` spends and
+   `DEFAULT_WALK_BUDGET` of wall-clock time by default — and reject a repeated coin id as a cycle.
+   The hop cap alone is insufficient: it bounds neither elapsed time nor per-hop CLVM cost, so a
+   hostile source serving a structurally valid, ever-advancing chain of DISTINCT recreations trips
+   no other guard. `ChainSource` is synchronous, so that is the caller's thread. A budget overrun
+   MUST report as `LineageWalkError::DeadlineExceeded` (projecting to `ChainSourceError::Timeout`),
+   never as `TooDeep` or `Malformed` — the source may have been entirely honest.
+6. **Bound per-hop CLVM memory.** A CLVM allocator is an arena that frees nothing until dropped, so
+   one shared across hops accumulates every hop's puzzle, solution and evaluation. A conforming walk
+   MUST start each hop with a fresh allocator (or restore a checkpoint). Sharing one both costs
+   memory linear in the chain length and exhausts the arena's own node ceiling BEFORE
+   `MAX_LINEAGE_DEPTH` is reached, which makes the documented `TooDeep` refusal unreachable and
+   misreports the exhaustion as `Malformed`.
+7. **Preserve the three-valued discipline of §3.** `Ok(None)` means the launcher id names no coin,
    names a coin that is not wearing `SINGLETON_LAUNCHER_HASH`, was never spent into an eve, or the
    singleton was melted. Every read failure surfaces as `LineageWalkError::Source(_)` carrying the
    source's OWN error unchanged, so *unsupported* stays distinguishable from *unreadable* and
    neither is ever collapsed into an absence.
-6. **Treat an unreadable spend as unknown, never as the tip.** `coin_spend` answers `Ok(None)` for
+8. **Treat an unreadable spend as unknown, never as the tip.** `coin_spend` answers `Ok(None)` for
    "unspent **or** unknown" (§3), so a walk MUST consult the coin's own `spent_height` before
    concluding it has reached the tip. A coin recorded as SPENT whose spend the source does not serve
    MUST fail closed with `LineageWalkError::Malformed`. Reporting it as the tip would present a
    superseded state as current — and if the unserved spend was the melt, a dead singleton would
    authenticate as live; at the launcher it would degrade an unknown into "never launched",
    violating §3.
-7. **Refuse an unreadable `CREATE_COIN`.** Once a condition's opcode is known to be `CREATE_COIN`,
+9. **Refuse an unreadable `CREATE_COIN`.** Once a condition's opcode is known to be `CREATE_COIN`,
    arguments the walk cannot decode (including an amount outside `i64`, or a negative amount that is
    not the melt marker) MUST be a refusal. Skipping such a condition makes a spend look as though it
-   emitted no odd-amount child — a phantom melt, i.e. requirement 6's defect reached through the
+   emitted no odd-amount child — a phantom melt, i.e. requirement 8's defect reached through the
    condition decoder.
 
 `MAX_LINEAGE_DEPTH` is the ecosystem's SINGLE source of truth for this bound. A DIG crate that
