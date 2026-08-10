@@ -60,6 +60,31 @@ pub enum ChainSourceError {
         /// The maximum number of records the consumer will accept.
         limit: usize,
     },
+
+    /// A puzzle reveal expanded to more than the walk's decompressed-size bound.
+    ///
+    /// Distinct from [`Malformed`](Self::Malformed) on purpose: the reveal may be perfectly
+    /// well-formed chain data — it is simply larger, once its CLVM back-references are expanded,
+    /// than this walk will authenticate. Blaming the source for corruption would be a lie, and
+    /// would hide the one thing a consumer can act on: the payload was too big, not wrong.
+    #[error("puzzle reveal expands beyond the {limit}-byte bound")]
+    RevealTooLarge {
+        /// The expanded-size bound the walk refused to exceed.
+        limit: usize,
+    },
+
+    /// A singleton lineage walk exceeded its hop bound before reaching the tip.
+    ///
+    /// Distinct from every other variant, and deliberately NOT a silent truncation: the walk found
+    /// more hops than it will follow, so the lineage it could build is INCOMPLETE and must never be
+    /// presented as the whole lineage (a partial member set would make
+    /// [`SingletonLineage::contains`](crate::SingletonLineage::contains) answer `false` for genuine
+    /// members — a fail-OPEN membership answer on a money path). The answer is unknown → fail closed.
+    #[error("singleton lineage walk exceeded its {limit}-hop bound")]
+    LineageTooDeep {
+        /// The hop bound the walk refused to exceed.
+        limit: usize,
+    },
 }
 
 #[cfg(test)]
@@ -76,6 +101,22 @@ mod tests {
             err.to_string(),
             "chain source returned 100001 records, exceeding the 100000-record cap"
         );
+    }
+
+    /// "Too big" must never read as "corrupt": the reveal may be perfectly valid chain data, and a
+    /// consumer that cannot tell the two apart cannot tell a hostile source from a heavy one.
+    #[test]
+    fn reveal_too_large_is_distinct_from_malformed() {
+        let too_large = ChainSourceError::RevealTooLarge { limit: 4_194_304 };
+        assert_eq!(
+            too_large.to_string(),
+            "puzzle reveal expands beyond the 4194304-byte bound"
+        );
+        assert_ne!(
+            too_large,
+            ChainSourceError::Malformed("undecodable program".to_string())
+        );
+        assert!(!matches!(too_large, ChainSourceError::Malformed(_)));
     }
 
     #[test]
