@@ -103,6 +103,22 @@ mod tests {
         );
     }
 
+    /// "Too big" must never read as "corrupt": the reveal may be perfectly valid chain data, and a
+    /// consumer that cannot tell the two apart cannot tell a hostile source from a heavy one.
+    #[test]
+    fn reveal_too_large_is_distinct_from_malformed() {
+        let too_large = ChainSourceError::RevealTooLarge { limit: 4_194_304 };
+        assert_eq!(
+            too_large.to_string(),
+            "puzzle reveal expands beyond the 4194304-byte bound"
+        );
+        assert_ne!(
+            too_large,
+            ChainSourceError::Malformed("undecodable program".to_string())
+        );
+        assert!(!matches!(too_large, ChainSourceError::Malformed(_)));
+    }
+
     #[test]
     fn too_many_records_is_distinct_from_malformed() {
         let too_many = ChainSourceError::TooManyRecords { count: 5, limit: 1 };

@@ -57,6 +57,9 @@ Every fallible method distinguishes:
   hostile-input bound allows; distinct from `Malformed` (each record may be well-formed, but the
   count exceeds the cap) — the consumer fails closed the same as every other variant.
 - `Timeout` — also carries a lineage walk that exceeded its wall-clock budget (§4a).
+- `RevealTooLarge { limit }` — a puzzle reveal expands, once its CLVM back-references are unfolded,
+  beyond the walk's bound (§4a). Distinct from `Malformed`: the reveal may be entirely well-formed
+  chain data and merely larger than the walk will authenticate.
 - `LineageTooDeep { limit }` — a singleton lineage walk exceeded its hop bound (§4a). The lineage it
   could build is INCOMPLETE, so it is refused rather than truncated: a partial member set would make
   `contains` answer `false` for genuine members, which is a fail-OPEN membership answer.
@@ -85,12 +88,22 @@ reads would have to hand-roll the §4 money-critical requirement. The optional, 
 ```rust
 pub const MAX_LINEAGE_DEPTH: usize = 100_000;
 pub const DEFAULT_WALK_BUDGET: Duration = Duration::from_secs(45);
+pub const MAX_REVEAL_EXPANDED_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_HOP_CLVM_COST: u64 = 100_000_000;
 
-pub struct WalkBounds { pub max_hops: usize, pub budget: Duration }  // Default: the two constants above
+// Fields are PRIVATE and `max_hops` is clamped to MAX_LINEAGE_DEPTH; the guards cannot be
+// disabled through a struct literal. Default: the two bound constants above.
+pub struct WalkBounds { /* private */ }
+impl WalkBounds {
+    pub fn hops(max_hops: usize) -> Self;   // clamped to MAX_LINEAGE_DEPTH
+    pub fn within(self, budget: Duration) -> Self;
+    pub fn max_hops(self) -> usize;
+    pub fn budget(self) -> Duration;
+}
 
 pub enum LineageWalkError<E> {
     Source(E), Malformed(String), NotASingleton { coin_id },
-    TooDeep { limit }, DeadlineExceeded { budget },
+    RevealTooLarge { coin_id, limit }, TooDeep { limit }, DeadlineExceeded { budget },
 }
 
 pub fn walk_singleton_lineage<S: ChainSource>(source: &S, launcher_id: Bytes32)
@@ -131,13 +144,39 @@ A conforming walk MUST:
    serialized in the CLVM back-reference form — the compressed encoding full nodes accept and block
    generators emit, which a curried singleton reveal exercises heavily. A walk that reads only the
    non-backref form reports a genuine singleton as `Malformed`, blaming an honest source.
-5. **Refuse, never truncate, past EITHER bound** — `MAX_LINEAGE_DEPTH` spends and
+5. **Refuse, never truncate, past ANY bound** — `MAX_LINEAGE_DEPTH` spends and
    `DEFAULT_WALK_BUDGET` of wall-clock time by default — and reject a repeated coin id as a cycle.
-   The hop cap alone is insufficient: it bounds neither elapsed time nor per-hop CLVM cost, so a
-   hostile source serving a structurally valid, ever-advancing chain of DISTINCT recreations trips
-   no other guard. `ChainSource` is synchronous, so that is the caller's thread. A budget overrun
-   MUST report as `LineageWalkError::DeadlineExceeded` (projecting to `ChainSourceError::Timeout`),
-   never as `TooDeep` or `Malformed` — the source may have been entirely honest.
+   The hop cap alone is insufficient: it bounds neither elapsed time nor per-hop cost, so a hostile
+   source serving a structurally valid, ever-advancing chain of DISTINCT recreations trips no other
+   guard. `ChainSource` is synchronous, so that is the caller's thread. A budget overrun MUST report
+   as `LineageWalkError::DeadlineExceeded` (projecting to `ChainSourceError::Timeout`), never as
+   `TooDeep` or `Malformed` — the source may have been entirely honest.
+
+   The wall-clock budget is checked BETWEEN hops, so it is a **backstop**, not a hard deadline: a
+   conforming walk returns within `budget + one worst-case hop`. That guarantee is vacuous unless
+   the cost of ONE hop is itself bounded, which is what §5a and §5b require.
+
+5a. **Bound the EXPANDED size of a puzzle reveal, before hashing, parsing or running it.** CLVM
+   back-references are a compression: the bytes on the wire describe a shared DAG, while every
+   consumer of that DAG — the reveal-binding hash, curried-puzzle parsing, the evaluator — sees the
+   tree it unfolds into, and a `k`-level self-referential DAG unfolds into `2^k` nodes. A conforming
+   walk MUST refuse a reveal whose expansion exceeds `MAX_REVEAL_EXPANDED_BYTES`, reporting
+   `LineageWalkError::RevealTooLarge` (projecting to `ChainSourceError::RevealTooLarge`) — never
+   `Malformed`, because the reveal may be valid chain data that is merely too large.
+
+   Two properties are normative, and each closes an attack the other does not. The bound MUST be on
+   the EXPANSION, not on the serialized length: a serialized-length cap large enough for an honest
+   singleton is orders of magnitude above the bomb, which is about a kilobyte. And the bound MUST be
+   applied BEFORE the reveal-binding hash, so that every later use of those bytes is downstream of
+   it: a bomb curried as the INNER puzzle of an otherwise genuine singleton passes the binding check
+   truthfully — the walk derived that coin's puzzle hash from the bomb's own tree hash — and
+   detonates in whatever parses the reveal next. Memoizing the binding hash does not close this;
+   only bounding the expansion ahead of all of it does.
+
+5b. **Bound the CLVM cost of ONE hop.** A spend's puzzle reveal is hash-bound to its coin, but its
+   SOLUTION is bound to nothing — the source chooses it freely. A conforming walk MUST evaluate with
+   an explicit per-hop ceiling (`MAX_HOP_CLVM_COST`), never the whole-block cost limit, or one hop
+   may legitimately burn an entire block's worth of evaluation.
 6. **Bound per-hop CLVM memory.** A CLVM allocator is an arena that frees nothing until dropped, so
    one shared across hops accumulates every hop's puzzle, solution and evaluation. A conforming walk
    MUST start each hop with a fresh allocator (or restore a checkpoint). Sharing one both costs

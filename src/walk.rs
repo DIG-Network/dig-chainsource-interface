@@ -44,7 +44,7 @@ use chia_protocol::{Bytes32, Coin, CoinSpend, Program};
 use chia_puzzle_types::singleton::SingletonArgs;
 use chia_puzzles::SINGLETON_LAUNCHER_HASH;
 use chia_sdk_driver::{Layer, Puzzle, SingletonLayer};
-use chia_sdk_types::run_puzzle;
+use chia_sdk_types::run_puzzle_with_cost;
 use clvm_traits::FromClvm;
 use clvm_utils::{tree_hash_from_bytes, TreeHash};
 use clvmr::serde::node_from_bytes_backrefs;
@@ -88,23 +88,56 @@ pub const MAX_LINEAGE_DEPTH: usize = 100_000;
 /// and 20 ms per read, an attacker buys the better part of an hour of hang, inside whatever ceremony
 /// the caller was performing.
 ///
-/// This budget is therefore the PRIMARY denial-of-service defense and the hop cap is the
-/// belt-and-braces bound beneath it. It is generous enough for any legitimate lineage over a healthy
-/// source and matches the equivalent bound in `chia-query`'s walk, so the two agree about how long a
-/// lineage resolution may take.
+/// # What this budget actually guarantees
+///
+/// It is checked BETWEEN hops, never inside one, so it is a **backstop** rather than a hard
+/// deadline: the walk returns after at most `budget + one worst-case hop`. That second term is only
+/// meaningful because it is itself bounded — [`MAX_REVEAL_EXPANDED_BYTES`] caps what a hop may hash
+/// and [`MAX_HOP_CLVM_COST`] caps what it may evaluate. Without those two, this budget bounds
+/// nothing at all, because a single hop can be made arbitrarily expensive.
 pub const DEFAULT_WALK_BUDGET: Duration = Duration::from_secs(45);
+
+/// The CLVM cost ceiling for evaluating ONE spend's inner puzzle.
+///
+/// # Why not the block cost
+///
+/// `chia_sdk_types::run_puzzle` evaluates at `MAINNET_CONSTANTS.max_block_cost_clvm` — eleven
+/// billion, a whole block — and a spend's SOLUTION is bound to nothing: the reveal-binding hash
+/// commits the coin to its puzzle, but the source chooses the solution freely. One hop may therefore
+/// legitimately burn an entire block's worth of evaluation, which makes
+/// [`DEFAULT_WALK_BUDGET`]'s between-hops check a promise the walk cannot keep.
+///
+/// # Why this value
+///
+/// Measured cost of the puzzles a hop actually runs: the singleton launcher spend that opens every
+/// lineage costs **11,932**, and a `p2_delegated_puzzle_or_hidden_puzzle` inner spend emitting one
+/// recreation costs **18,092**. This ceiling is ~5,500x the larger of those and ~110x below a full
+/// block, which leaves ample room for heavier inner layers (DID, NFT state + ownership + royalty,
+/// vault member trees) while capping a hop's evaluation at roughly a tenth of a second.
+///
+/// A spend that exceeds it is reported as [`LineageWalkError::Malformed`], because the evaluator
+/// reports cost exhaustion the same way it reports any other failure to run.
+pub const MAX_HOP_CLVM_COST: u64 = 100_000_000;
 
 /// How far, and for how long, a lineage walk may run before failing closed.
 ///
 /// Both bounds are always present: [`WalkBounds::default`] is what [`walk_singleton_lineage`] uses,
 /// so a provider whose `resolve_singleton_lineage` is a one-line delegation INHERITS the
 /// denial-of-service guards rather than having to remember them.
+///
+/// # Why the fields are private
+///
+/// They are guards. Public fields make `WalkBounds { max_hops: usize::MAX, budget: Duration::MAX }`
+/// a struct literal that disables both of them with nothing in the diff to signal it, and the
+/// constructors below cannot be bypassed the same way: [`WalkBounds::hops`] CLAMPS to
+/// [`MAX_LINEAGE_DEPTH`], so no caller can widen the walk past the ecosystem's canonical bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WalkBounds {
     /// The maximum number of spends to follow ([`LineageWalkError::TooDeep`] beyond it).
-    pub max_hops: usize,
+    max_hops: usize,
     /// The wall-clock budget for the whole walk ([`LineageWalkError::DeadlineExceeded`] beyond it).
-    pub budget: Duration,
+    budget: Duration,
 }
 
 impl Default for WalkBounds {
@@ -117,12 +150,12 @@ impl Default for WalkBounds {
 }
 
 impl WalkBounds {
-    /// The default bounds with a chosen hop cap — the form tests use to exercise
-    /// [`LineageWalkError::TooDeep`] over a short chain.
+    /// The default bounds with a chosen hop cap, CLAMPED to [`MAX_LINEAGE_DEPTH`] — the form tests
+    /// use to exercise [`LineageWalkError::TooDeep`] over a short chain.
     #[must_use]
     pub fn hops(max_hops: usize) -> Self {
         Self {
-            max_hops,
+            max_hops: max_hops.min(MAX_LINEAGE_DEPTH),
             ..Self::default()
         }
     }
@@ -131,6 +164,18 @@ impl WalkBounds {
     #[must_use]
     pub fn within(self, budget: Duration) -> Self {
         Self { budget, ..self }
+    }
+
+    /// The maximum number of spends this walk will follow.
+    #[must_use]
+    pub fn max_hops(self) -> usize {
+        self.max_hops
+    }
+
+    /// The wall-clock budget for the whole walk.
+    #[must_use]
+    pub fn budget(self) -> Duration {
+        self.budget
     }
 }
 
@@ -640,8 +685,11 @@ fn run_for_continuation<E>(
     puzzle: NodePtr,
     solution: NodePtr,
 ) -> Result<Continuation, LineageWalkError<E>> {
-    let output = run_puzzle(allocator, puzzle, solution)
-        .map_err(|error| LineageWalkError::Malformed(format!("puzzle did not run: {error}")))?;
+    // An EXPLICIT ceiling, not `run_puzzle`'s whole-block default: the solution is attacker-chosen
+    // (only the reveal is hash-bound to the coin), so a hop's evaluation is bounded here or nowhere.
+    let output = run_puzzle_with_cost(allocator, puzzle, solution, MAX_HOP_CLVM_COST, false)
+        .map_err(|error| LineageWalkError::Malformed(format!("puzzle did not run: {error}")))?
+        .1;
     let conditions = Vec::<NodePtr>::from_clvm(allocator, output).map_err(|error| {
         LineageWalkError::Malformed(format!("undecodable condition list: {error}"))
     })?;
@@ -676,16 +724,18 @@ fn run_for_continuation<E>(
                  melt marker {SINGLETON_MELT_AMOUNT}"
             ))
         })?;
-        if amount % 2 == 0 {
-            continue;
-        }
-        // Now — and only now — the condition is known to address a coin the walk must follow, so
-        // an unreadable puzzle hash is a refusal rather than an omission.
+        // Decoded BEFORE the parity skip, not after. Every non-melt CREATE_COIN addresses a real
+        // coin, so an unreadable puzzle hash is inconsistent chain data whatever the amount's
+        // parity; deferring this past the skip would quietly accept a malformed hash on an
+        // even-amount payment, which is strictly less strict for no benefit.
         let puzzle_hash = Bytes32::from_clvm(allocator, puzzle_hash).map_err(|error| {
             LineageWalkError::Malformed(format!(
                 "undecodable CREATE_COIN condition: recreation puzzle hash: {error}"
             ))
         })?;
+        if amount % 2 == 0 {
+            continue;
+        }
         if recreation.is_some() {
             return Err(LineageWalkError::Malformed(
                 "a singleton spend emitted more than one odd-amount child".to_string(),
@@ -1077,6 +1127,29 @@ mod tests {
         );
     }
 
+    /// An EVEN-amount CREATE_COIN with an unreadable puzzle hash refuses too — the parity skip must
+    /// not become a place unreadable conditions hide.
+    ///
+    /// Even amounts are ordinary payments the walk deliberately ignores, so it is tempting to skip
+    /// them before decoding their puzzle hash. That is strictly less strict than refusing: an
+    /// even-amount condition still addresses a real coin, and chain data the walk cannot read is
+    /// inconsistent whatever the amount's parity. The melt marker is the ONE case that legitimately
+    /// carries no 32-byte hash, and it returns before this point.
+    #[test]
+    fn an_even_amount_create_coin_with_an_unreadable_puzzle_hash_still_refuses() {
+        let allocator = &mut Allocator::new();
+        let short_hash = (CREATE_COIN, ([0x0Eu8; 31], (2i64, ())))
+            .to_clvm(allocator)
+            .expect("the condition allocates");
+
+        let error = continuation_of(allocator, vec![short_hash])
+            .expect_err("an unreadable puzzle hash is refused whatever the amount's parity");
+        assert!(
+            matches!(error, LineageWalkError::Malformed(detail) if detail.contains("CREATE_COIN")),
+            "the refusal must name the condition it could not read"
+        );
+    }
+
     /// A singleton spend emits at most ONE odd-amount child; two is chain data the walk cannot
     /// interpret, and picking either would be a guess about which coin is the singleton.
     #[test]
@@ -1097,5 +1170,112 @@ mod tests {
                 "a singleton spend emitted more than one odd-amount child".to_string()
             )
         );
+    }
+
+    /// The bound is pinned from BOTH sides on a node of exactly known cost.
+    ///
+    /// `nil` costs 1 (its `0x01` prefix, no bytes); a pair costs 65 (`0x02` plus two 32-byte child
+    /// hashes). So `((nil . nil) . nil)` costs `65 + (65 + 1 + 1) + 1` = 133. A bound tested only
+    /// from one side confirms itself: at 132 the node must be refused and at 133 it must be
+    /// accepted, and only asserting both proves the comparison is `>` rather than `>=` or nothing.
+    #[test]
+    fn the_expanded_bound_admits_a_node_at_the_limit_and_refuses_one_byte_over() {
+        let allocator = &mut Allocator::new();
+        let inner = allocator
+            .new_pair(NodePtr::NIL, NodePtr::NIL)
+            .expect("a pair allocates");
+        let node = allocator
+            .new_pair(inner, NodePtr::NIL)
+            .expect("a pair allocates");
+
+        assert_eq!(
+            expanded_hash_input_bytes(allocator, node, 133),
+            133,
+            "the cost model must be exactly 65 per pair and 1 + len per atom"
+        );
+        assert!(
+            expanded_hash_input_bytes(allocator, node, 132) > 132,
+            "one byte over the bound must be refused"
+        );
+    }
+
+    /// A bomb must SATURATE rather than be computed — the whole point of the saturating traversal.
+    ///
+    /// 40 levels of self-cons is a notional 2^40 nodes. If the cost were accumulated honestly this
+    /// test would not finish; that it returns `limit + 1` immediately is the property under test.
+    #[test]
+    fn a_self_referential_dag_saturates_instead_of_being_counted() {
+        let allocator = &mut Allocator::new();
+        let mut node = allocator.new_atom(&[1]).expect("a one-byte atom allocates");
+        for _ in 0..40 {
+            node = allocator
+                .new_pair(node, node)
+                .expect("a self-cons adds one pair");
+        }
+
+        assert_eq!(
+            expanded_hash_input_bytes(allocator, node, MAX_REVEAL_EXPANDED_BYTES),
+            MAX_REVEAL_EXPANDED_BYTES + 1,
+            "the traversal must stop one byte past the bound, never compute 2^40"
+        );
+    }
+
+    /// An honest reveal-sized tree must NOT be refused — the nearest wrong fix is a bound so tight
+    /// it rejects real singletons, and this is the control that would catch it.
+    #[test]
+    fn a_tree_the_size_of_a_heavy_honest_reveal_is_admitted() {
+        // 137 KB expanded is the measured cost of a singleton wrapping an NFT state + ownership +
+        // royalty stack with eight long URIs — the heaviest realistic reveal (see
+        // `MAX_REVEAL_EXPANDED_BYTES`). Built here as a right-leaning list of 2,100 pairs, which
+        // costs 65 each: ~136.5 KB.
+        let allocator = &mut Allocator::new();
+        let mut node = NodePtr::NIL;
+        for _ in 0..2_100 {
+            node = allocator
+                .new_pair(NodePtr::NIL, node)
+                .expect("a pair allocates");
+        }
+
+        let cost = expanded_hash_input_bytes(allocator, node, MAX_REVEAL_EXPANDED_BYTES);
+        assert!(
+            cost > 100_000,
+            "the control is only load-bearing if it is genuinely reveal-sized; it cost {cost}"
+        );
+        assert!(
+            cost <= MAX_REVEAL_EXPANDED_BYTES,
+            "a reveal the size of a heavy honest one must be admitted; it cost {cost}"
+        );
+    }
+
+    /// `successor_of` must keep owning its allocator, and the guard has to be mechanical.
+    ///
+    /// The doc comment on that function explains why the arena is created per hop. Hoisting it is a
+    /// three-line change — add a parameter, create one in the caller, pass it — of exactly the shape
+    /// a "stop reallocating per hop" optimisation takes, and NOTHING in the suite goes red when it
+    /// happens: the endless-chain tests cap out at 64 hops, far below the arena's node ceiling. So
+    /// the signature itself is asserted.
+    #[test]
+    fn successor_of_takes_no_allocator_parameter() {
+        let source = include_str!("walk.rs");
+        let signature = source
+            .split_once("fn successor_of<E>(")
+            .expect("successor_of is declared in this file")
+            .1
+            .split_once(") ->")
+            .expect("its parameter list is closed")
+            .0;
+
+        assert!(
+            !signature.contains("Allocator"),
+            "successor_of must create its own allocator per hop, not accept a hoisted one: \
+             ({signature})"
+        );
+    }
+
+    /// A hop cap wider than the ecosystem's canonical bound is CLAMPED, not honoured.
+    #[test]
+    fn a_hop_cap_beyond_the_canonical_bound_is_clamped() {
+        assert_eq!(WalkBounds::hops(usize::MAX).max_hops(), MAX_LINEAGE_DEPTH);
+        assert_eq!(WalkBounds::hops(7).max_hops(), 7);
     }
 }
