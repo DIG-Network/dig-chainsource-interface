@@ -685,4 +685,75 @@ mod tests {
             Ok(Continuation::Recreates(hash, 3)) if hash == puzzle_hash
         ));
     }
+
+    /// The CANONICAL chia melt condition carries a NIL puzzle hash, not a 32-byte one.
+    ///
+    /// `chia_sdk_types::Condition::MeltSingleton` declares `puzzle_hash: () if ()`, so every melt
+    /// built by standard chia-wallet-sdk tooling — which is what `dig-did` and `chip35_dl_coin`
+    /// emit — is `(51 () -113)`. A decoder that forces `Bytes32` BEFORE testing the melt marker
+    /// refuses it, and a DID or DataStore melted with standard tooling then becomes permanently
+    /// unanswerable: the walk reports "the chain data is inconsistent" forever, blaming an honest
+    /// source, where the truth is a plain, final absence.
+    ///
+    /// Both forms are minted in practice, so both must decode. The 32-byte form is covered by
+    /// [`well_formed_conditions_still_decode_as_melt_and_as_recreation`]; this is the one that
+    /// fixture cannot express.
+    #[test]
+    fn the_canonical_nil_puzzle_hash_melt_still_decodes_as_a_melt() {
+        let allocator = &mut Allocator::new();
+        let canonical_melt = (CREATE_COIN, ((), (SINGLETON_MELT_AMOUNT, ())))
+            .to_clvm(allocator)
+            .expect("the condition allocates");
+
+        assert!(
+            matches!(
+                continuation_of(allocator, vec![canonical_melt]),
+                Ok(Continuation::Ends)
+            ),
+            "the canonical `(51 () -113)` melt must end the lineage, not refuse"
+        );
+    }
+
+    /// Reading the melt marker first must NOT relax the refusal on an unreadable RECREATION.
+    ///
+    /// The whole point of decoding the puzzle hash late is that the melt no longer needs one. An
+    /// odd, positive amount is a recreation, and a recreation the walk cannot address is still a
+    /// refusal — otherwise the strictness this decoder exists for would have been traded away for
+    /// the melt fix.
+    #[test]
+    fn a_recreation_whose_puzzle_hash_is_not_32_bytes_still_refuses() {
+        let allocator = &mut Allocator::new();
+        let short_hash = (CREATE_COIN, ([0x0Eu8; 31], (3i64, ())))
+            .to_clvm(allocator)
+            .expect("the condition allocates");
+
+        let error = continuation_of(allocator, vec![short_hash])
+            .expect_err("a recreation with an unreadable puzzle hash is not a melt");
+        assert!(
+            matches!(error, LineageWalkError::Malformed(detail) if detail.contains("CREATE_COIN")),
+            "the refusal must name the condition it could not read"
+        );
+    }
+
+    /// A singleton spend emits at most ONE odd-amount child; two is chain data the walk cannot
+    /// interpret, and picking either would be a guess about which coin is the singleton.
+    #[test]
+    fn two_odd_amount_children_refuse_rather_than_choosing_one() {
+        let allocator = &mut Allocator::new();
+        let first = (CREATE_COIN, (Bytes32::new([0x1A; 32]), (1i64, ())))
+            .to_clvm(allocator)
+            .expect("the condition allocates");
+        let second = (CREATE_COIN, (Bytes32::new([0x1B; 32]), (3i64, ())))
+            .to_clvm(allocator)
+            .expect("the condition allocates");
+
+        let error = continuation_of(allocator, vec![first, second])
+            .expect_err("two odd-amount children are ambiguous");
+        assert_eq!(
+            error,
+            LineageWalkError::Malformed(
+                "a singleton spend emitted more than one odd-amount child".to_string()
+            )
+        );
+    }
 }
