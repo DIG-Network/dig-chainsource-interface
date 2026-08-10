@@ -44,8 +44,9 @@ use chia_puzzle_types::singleton::SingletonArgs;
 use chia_puzzles::SINGLETON_LAUNCHER_HASH;
 use chia_sdk_driver::{Layer, Puzzle, SingletonLayer};
 use chia_sdk_types::run_puzzle;
-use clvm_traits::{FromClvm, ToClvm};
+use clvm_traits::FromClvm;
 use clvm_utils::{tree_hash, TreeHash};
+use clvmr::serde::node_from_bytes_backrefs;
 use clvmr::{Allocator, NodePtr};
 
 use crate::error::ChainSourceError;
@@ -565,10 +566,16 @@ fn parse_spend<E>(
     Ok((Puzzle::parse(allocator, puzzle), solution))
 }
 
-/// Deserializes a [`Program`] into an allocated [`NodePtr`].
+/// Deserializes a [`Program`] into an allocated [`NodePtr`], accepting CLVM **back-references**.
+///
+/// Back-references are the compressed serialization full nodes accept and block generators emit: a
+/// repeated subtree is written once and pointed at thereafter, which a curried singleton puzzle
+/// does heavily. [`Program`]'s own `ToClvm` uses the NON-backref reader, so allocating through it
+/// makes a genuine compressed reveal unreadable — reported as [`LineageWalkError::Malformed`],
+/// i.e. blaming an honest source for chain data the chain itself considers valid. `Program::run`
+/// reads back-references for exactly this reason, and the walk matches it.
 fn alloc<E>(allocator: &mut Allocator, program: &Program) -> Result<NodePtr, LineageWalkError<E>> {
-    program
-        .to_clvm(allocator)
+    node_from_bytes_backrefs(allocator, program.as_ref())
         .map_err(|error| LineageWalkError::Malformed(format!("undecodable program: {error}")))
 }
 
@@ -581,6 +588,8 @@ fn program_tree_hash<E>(program: &Program) -> Result<TreeHash, LineageWalkError<
 
 #[cfg(test)]
 mod tests {
+    use clvm_traits::ToClvm;
+
     use super::*;
 
     /// The cycle guard, pinned at the only level it can be: no end-to-end fixture can reach it.

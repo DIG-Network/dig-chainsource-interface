@@ -27,6 +27,8 @@ use chia_sdk_driver::{
 use chia_sdk_test::Simulator;
 use chia_sdk_types::{Condition, Conditions};
 use clvm_utils::TreeHash;
+use clvmr::serde::{node_from_bytes, node_to_bytes_backrefs};
+use clvmr::Allocator;
 use dig_chainsource_interface::{
     walk_singleton_lineage, walk_singleton_lineage_bounded, ChainSource, ChainSourceError,
     CoinRecord, LineageWalkError, MockChainSource, SingletonLineage,
@@ -51,6 +53,31 @@ struct SimSource<'a> {
     /// A coin whose RECORD this source withholds, so a derived successor cannot be bound to real
     /// chain state. Drives [`require_coin_exists`]'s guard.
     withheld_record: Option<Bytes32>,
+    /// Re-serializes every puzzle reveal in the CLVM **back-reference** form — the compressed
+    /// encoding full nodes accept and block generators emit. The chain data is byte-for-byte
+    /// equivalent; only its serialization differs.
+    backref_reveals: bool,
+}
+
+impl SimSource<'_> {
+    /// Applies [`SimSource::backref_reveals`] to a spend on its way out of the source.
+    fn serialized_as_configured(&self, spend: CoinSpend) -> CoinSpend {
+        if !self.backref_reveals {
+            return spend;
+        }
+        CoinSpend::new(
+            spend.coin,
+            backref_serialized(&spend.puzzle_reveal),
+            spend.solution,
+        )
+    }
+}
+
+/// Re-encodes `program` using CLVM back-references, preserving the tree it denotes exactly.
+fn backref_serialized(program: &Program) -> Program {
+    let mut allocator = Allocator::new();
+    let node = node_from_bytes(&mut allocator, program.as_ref()).expect("the program deserializes");
+    Program::from(node_to_bytes_backrefs(&allocator, node).expect("the program re-serializes"))
 }
 
 impl ChainSource for SimSource<'_> {
@@ -95,7 +122,10 @@ impl ChainSource for SimSource<'_> {
         if self.withheld_spend == Some(coin_id) {
             return Ok(None);
         }
-        Ok(self.sim.coin_spend(coin_id))
+        Ok(self
+            .sim
+            .coin_spend(coin_id)
+            .map(|spend| self.serialized_as_configured(spend)))
     }
 
     fn resolve_singleton_lineage(
@@ -228,6 +258,7 @@ fn source(sim: &Simulator) -> SimSource<'_> {
         children_reads: Cell::new(0),
         withheld_spend: None,
         withheld_record: None,
+        backref_reveals: false,
     }
 }
 
@@ -256,6 +287,54 @@ fn walk_returns_every_coin_from_the_launcher_to_the_tip() -> Result<()> {
             coin.coin_id()
         );
     }
+    Ok(())
+}
+
+/// The SAME honest chain, with every puzzle reveal serialized in the CLVM **back-reference** form.
+///
+/// Back-references are the compressed encoding full nodes accept and block generators emit: a
+/// repeated subtree is written once and pointed at thereafter. A curried singleton puzzle repeats
+/// subtrees heavily, so this is not an exotic case — it is what a real singleton's reveal looks
+/// like whenever it travels compressed.
+///
+/// `chia_protocol::Program`'s `ToClvm` deserializes with the NON-backref reader, so a walk that
+/// allocates a reveal that way cannot read one, and reports `Malformed` — "the chain data is
+/// untrustworthy" — about a genuine singleton served by an honest source. `Program::run` in that
+/// very same file uses the backref reader, which is the shape the walk must match.
+#[test]
+fn a_backref_serialized_puzzle_reveal_resolves_exactly_as_the_plain_one() -> Result<()> {
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+    let mut singleton = launch(&mut sim, ctx)?;
+    advance(&mut sim, ctx, &mut singleton)?;
+    advance(&mut sim, ctx, &mut singleton)?;
+
+    // The fixture is only distinguishing if some reveal genuinely compresses — a chain whose
+    // backref encoding happened to equal its plain one would re-run the honest test and prove
+    // nothing. (The eve's curried singleton reveal is the one that does.)
+    let eve_reveal = sim
+        .coin_spend(singleton.trail[1].coin_id())
+        .expect("the eve is spent")
+        .puzzle_reveal;
+    let compressed = backref_serialized(&eve_reveal);
+    assert_ne!(
+        compressed.as_ref(),
+        eve_reveal.as_ref(),
+        "the reveal must actually use back-references for this fixture to bite"
+    );
+    let mut allocator = Allocator::new();
+    assert!(
+        node_from_bytes(&mut allocator, compressed.as_ref()).is_err(),
+        "the non-backref reader must be unable to read the compressed reveal"
+    );
+
+    let mut src = source(&sim);
+    src.backref_reveals = true;
+    let lineage = walk_singleton_lineage(&src, singleton.launcher_id)?
+        .expect("a compressed reveal is still a genuine singleton");
+
+    assert_eq!(lineage.tip(), singleton.tip().coin_id());
+    assert_eq!(lineage.len(), singleton.trail.len());
     Ok(())
 }
 
