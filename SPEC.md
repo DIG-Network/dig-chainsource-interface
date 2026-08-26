@@ -13,9 +13,15 @@ typed query/result/error shapes that cross it. It is a pure **leaf**:
 - **No I/O, no network, no keys, no filesystem.** The crate performs zero side effects.
 - **Reads only.** There is NO broadcast/push/submit/spend method anywhere in the crate, by design.
   Value-moving paths live entirely outside it.
-- **No DIG-crate dependencies.** Runtime dependencies are `chia-protocol` and `thiserror` ONLY.
-  It does not depend on `chia-wallet-sdk`, `chia-puzzle-types`, `chia-puzzles`, `async-trait`, or any
-  DIG crate. This keeps it the bottom of the crate hierarchy (level 00) and cleanly wasm-buildable.
+- **No DIG-crate dependencies.** In the DEFAULT feature set, runtime dependencies are `chia-protocol`
+  and `thiserror` ONLY. It depends on no DIG crate and no `async-trait` in any configuration. This
+  keeps it the bottom of the crate hierarchy (level 00) and cleanly wasm-buildable.
+  The non-default `lineage-walk` feature (§7) additionally pulls a CLVM evaluator and the vetted
+  singleton puzzle types — `chia-puzzle-types`, `chia-puzzles`, `chia-sdk-driver`, `chia-sdk-types`,
+  `clvm-traits`, `clvm-utils`, `clvmr`. A consumer that only needs the trait does not pay for them.
+  Every `chia-*` version is the **chia-wallet-sdk 0.36.0 ceiling**, never the newest on crates.io:
+  the primitives publish at 0.48 but the SDK cannot reach them, so `0.36.1` primitives beside
+  `0.36.0` `chia-sdk-*` is the coherent maximum. Mixing the two lines re-splits the crate.
 - **Object-safe and synchronous.** `Box<dyn ChainSource<Error = E>>` MUST compile.
 
 ## 2. The `ChainSource` trait — per-method contract
