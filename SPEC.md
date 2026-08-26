@@ -1,4 +1,4 @@
-# dig-chainsource-interface — normative specification (v0.4.0)
+# dig-chainsource-interface — normative specification (v0.3.2)
 
 This is the authoritative contract for the DIG Network canonical `ChainSource` interface. An
 independent reimplementation of this crate, of a provider, or of a consumer MUST conform to this

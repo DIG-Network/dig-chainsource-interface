@@ -8,7 +8,14 @@
 # aggregating canonical source). See SPEC.md for the normative contract.
 [package]
 name = "dig-chainsource-interface"
-version = "0.4.0"
+# PATCH, not major. The chia-sdk-* uplift below is INTERNAL: every `chia-sdk-*`, `clvm*` and
+# `chia-puzzle*` import is confined to `src/walk.rs`, and no type from any of them crosses a public
+# signature — `LineageWalkError<E>` carries only `E`/`String`/`Bytes32`/`usize`/`Duration`, and the
+# walk functions take and return `Bytes32`/`SingletonLineage`/`WalkBounds`. The one chia crate that
+# IS on the public surface, `chia-protocol`, is unchanged at 0.36.1. So no consumer — including the
+# `lineage-walk` ones — can observe this bump, and nine consumers pinning "0.3" must not be forced
+# to edit a manifest for a change that cannot reach them.
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
