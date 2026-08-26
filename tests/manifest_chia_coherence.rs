@@ -13,6 +13,18 @@
 //! The defect was **manifest coherence**, and manifest coherence is mechanically assertable. That
 //! is what these tests assert.
 //!
+//! ## If you revert-proof these tests, restore `Cargo.lock` as well
+//!
+//! Proving this guard fires means reintroducing a split into `Cargo.toml` and watching it fail.
+//! Running the suite in that state **silently re-resolves `Cargo.lock`** — 217 lines, when this was
+//! first done. Restoring only `Cargo.toml` therefore leaves the lock carrying BOTH the experiment's
+//! old line and the correct one: a two-line split, created by the proof, in the very crate whose
+//! job is to have none.
+//!
+//! Restore both files, and make the restore run pass `--locked`. That flag is what turns the
+//! leftover into a loud refusal instead of a silent green — without it cargo re-resolves again and
+//! the pollution ships.
+//!
 //! ## Why the manifest, and not `Cargo.lock`
 //!
 //! #5 is about the versions this crate DECLARES. The resolved lock legitimately contains older
