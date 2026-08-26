@@ -16,7 +16,7 @@ typed query/result/error shapes that cross it. It is a pure **leaf**:
 - **No DIG-crate dependencies.** In the DEFAULT feature set, runtime dependencies are `chia-protocol`
   and `thiserror` ONLY. It depends on no DIG crate and no `async-trait` in any configuration. This
   keeps it the bottom of the crate hierarchy (level 00) and cleanly wasm-buildable.
-  The non-default `lineage-walk` feature (§7) additionally pulls a CLVM evaluator and the vetted
+  The non-default `lineage-walk` feature (§4a) additionally pulls a CLVM evaluator and the vetted
   singleton puzzle types — `chia-puzzle-types`, `chia-puzzles`, `chia-sdk-driver`, `chia-sdk-types`,
   `clvm-traits`, `clvm-utils`, `clvmr`. A consumer that only needs the trait does not pay for them.
   Every `chia-*` version is the **chia-wallet-sdk 0.36.0 ceiling**, never the newest on crates.io:
