@@ -8,7 +8,7 @@
 # aggregating canonical source). See SPEC.md for the normative contract.
 [package]
 name = "dig-chainsource-interface"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -25,16 +25,21 @@ thiserror = "2"
 # --- `lineage-walk` only (see [features]) ------------------------------------------------------
 # The canonical launcher -> tip singleton walk DERIVES each successor by running the parent's inner
 # puzzle, so it needs a CLVM evaluator and the vetted singleton layer/puzzle types. Every version is
-# pinned to the same coherent chia-* set the rest of the DIG on-chain line rides (chia-protocol
-# 0.36 / chia-wallet-sdk 0.34); the SDK's own SingletonLayer is reused rather than re-implemented so
-# the walk cannot byte-drift from the puzzle it authenticates against.
+# pinned to the same coherent chia-* set the rest of the DIG on-chain line rides; the SDK's own
+# SingletonLayer is reused rather than re-implemented so the walk cannot byte-drift from the puzzle
+# it authenticates against.
+#
+# The ceiling is chia-wallet-sdk 0.36.0 and the versions below are ITS dependency set, NOT the
+# newest on crates.io: the primitives publish at 0.48 but the SDK cannot reach them, so 0.36.1
+# primitives beside 0.36.0 `chia-sdk-*` is the coherent maximum. Raising either family past its
+# own ceiling re-splits this crate rather than modernising it.
 chia-puzzle-types = { version = "0.36.1", optional = true }
-chia-puzzles = { version = "0.20", optional = true }
-chia-sdk-driver = { version = "0.34", optional = true }
-chia-sdk-types = { version = "0.34", optional = true }
+chia-puzzles = { version = "0.20.3", optional = true }
+chia-sdk-driver = { version = "0.36.0", optional = true }
+chia-sdk-types = { version = "0.36.0", optional = true }
 clvm-traits = { version = "0.36.1", optional = true }
 clvm-utils = { version = "0.36.1", optional = true }
-clvmr = { version = "0.16", optional = true }
+clvmr = { version = "0.16.2", optional = true }
 
 [features]
 default = []
@@ -58,6 +63,6 @@ hex = "0.4"
 # The in-process Chia Simulator: the lineage-walk tests authenticate against REAL singleton spends
 # (launcher, eve, recreation, melt) rather than hand-built fixtures, so the adversarial cases are
 # genuine chain data.
-chia-sdk-test = "0.34"
+chia-sdk-test = "0.36.0"
 chia-bls = "0.36.1"
 anyhow = "1"
