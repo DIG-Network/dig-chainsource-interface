@@ -15,7 +15,7 @@ name = "dig-chainsource-interface"
 # IS on the public surface, `chia-protocol`, is unchanged at 0.36.1. So no consumer — including the
 # `lineage-walk` ones — can observe this bump, and nine consumers pinning "0.3" must not be forced
 # to edit a manifest for a change that cannot reach them.
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
